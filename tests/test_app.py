@@ -200,6 +200,21 @@ def test_complete_task_double_call_only_one_winner(client, sync_session_factory,
         assert row.status == "done"
 
 
+def test_request_id_middleware_round_trips_inbound_header(client):
+    """Inbound X-Request-ID is honored and echoed back in the response."""
+    custom = "test-rid-abc-123"
+    response = client.get("/health", headers={"x-request-id": custom})
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == custom
+
+
+def test_request_id_middleware_mints_one_when_absent(client):
+    """No inbound id ⇒ middleware mints a UUID hex (32 chars) and returns it."""
+    response = client.get("/health")
+    rid = response.headers.get("X-Request-ID")
+    assert rid and len(rid) == 32 and all(c in "0123456789abcdef" for c in rid)
+
+
 def test_health_ready_returns_200_when_db_is_up(client):
     response = client.get("/health/ready")
     assert response.status_code == 200

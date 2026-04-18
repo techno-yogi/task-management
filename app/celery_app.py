@@ -14,6 +14,17 @@ from app.metrics import (
 from kombu import Exchange, Queue
 
 from app.config import settings
+from app.logging_setup import (
+    celery_task_id_ctx,
+    chunk_id_ctx,
+    configure_logging,
+    job_id_ctx,
+    sweep_id_ctx,
+    task_variant_id_ctx,
+)
+
+
+configure_logging()
 
 celery_app = Celery(
     "fastapi-celery-sqlalchemy-app",
@@ -113,11 +124,38 @@ def _task_labels(task, task_id, args, kwargs, einfo=None):
     return task_name, queue, worker
 
 
+_CORRELATION_BY_TASK = {
+    # task_name -> (positional-arg index for the id, contextvar to set)
+    "app.tasks.execute_task_variant": (0, task_variant_id_ctx),
+    "app.tasks.finalize_job_task": (1, job_id_ctx),
+    "app.tasks.finalize_chunk_task": (1, chunk_id_ctx),
+    "app.tasks.finalize_sweep_task": (1, sweep_id_ctx),
+    "app.tasks.dispatch_next_chunk_task": (0, sweep_id_ctx),
+    "app.tasks.prepare_and_dispatch_sweep_task": (0, sweep_id_ctx),
+}
+
+_PRERUN_TOKENS: dict[str, list] = {}
+
+
 @task_prerun.connect
 def _on_task_prerun(task_id=None, task=None, args=None, kwargs=None, **_):
     task_name, queue, worker = _task_labels(task, task_id, args, kwargs)
     celery_task_started_total.labels(task_name=task_name, queue=queue, worker=worker).inc()
     celery_task_inflight.labels(task_name=task_name, queue=queue, worker=worker).inc()
+
+    # Push correlation ids into contextvars so log lines for this task body
+    # are auto-tagged. Tokens are stashed by celery task_id and restored in
+    # task_postrun.
+    entries: list[tuple] = [(celery_task_id_ctx, celery_task_id_ctx.set(task_id))]
+    arg_map = _CORRELATION_BY_TASK.get(task_name)
+    if arg_map and args is not None:
+        idx, var = arg_map
+        if idx < len(args):
+            try:
+                entries.append((var, var.set(int(args[idx]))))
+            except (TypeError, ValueError):
+                pass
+    _PRERUN_TOKENS[task_id] = entries
 
 
 @task_postrun.connect
@@ -126,6 +164,15 @@ def _on_task_postrun(task_id=None, task=None, args=None, kwargs=None, state=None
     celery_task_inflight.labels(task_name=task_name, queue=queue, worker=worker).dec()
     if state == "SUCCESS":
         celery_task_succeeded_total.labels(task_name=task_name, queue=queue, worker=worker).inc()
+    entries = _PRERUN_TOKENS.pop(task_id, None)
+    if entries:
+        # Reset in reverse order to mirror the LIFO stack semantics of
+        # ContextVar.set/reset. Each entry is (var, token).
+        for var, token in reversed(entries):
+            try:
+                var.reset(token)
+            except (LookupError, ValueError):
+                pass
 
 
 @task_failure.connect
