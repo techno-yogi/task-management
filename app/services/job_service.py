@@ -69,6 +69,77 @@ async def get_sweep_async(session: AsyncSession, sweep_id: int) -> Sweep | None:
     return result.scalar_one_or_none()
 
 
+async def get_sweep_status_async(session: AsyncSession, sweep_id: int) -> dict[str, Any] | None:
+    """Cheap status snapshot for a sweep: header + per-status counts at every level.
+
+    Avoids the full graph eager-load that `get_sweep_async` does. Designed to be
+    safe to poll at sub-second cadence even for sweeps with 50k+ tasks.
+
+    Returns a dict shaped like `SweepStatusResponse` (see app.schemas.job), or
+    None if the sweep doesn't exist.
+    """
+    sweep_row = (
+        await session.execute(
+            select(
+                Sweep.id,
+                Sweep.name,
+                Sweep.status,
+                Sweep.finalized_by,
+                Sweep.total_chunks,
+                Sweep.total_jobs,
+                Sweep.total_tasks,
+            ).where(Sweep.id == sweep_id)
+        )
+    ).first()
+    if sweep_row is None:
+        return None
+
+    chunks_counts_q = (
+        select(Chunk.status, func.count())
+        .where(Chunk.sweep_id == sweep_id)
+        .group_by(Chunk.status)
+    )
+    jobs_counts_q = (
+        select(Job.status, func.count())
+        .where(Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id)))
+        .group_by(Job.status)
+    )
+    tasks_counts_q = (
+        select(TaskVariant.status, func.count())
+        .where(
+            TaskVariant.job_id.in_(
+                select(Job.id).where(
+                    Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id))
+                )
+            )
+        )
+        .group_by(TaskVariant.status)
+    )
+
+    def _bucket(rows: list[tuple[str, int]]) -> dict[str, int]:
+        out = {"pending": 0, "running": 0, "done": 0, "failed": 0}
+        for status_name, n in rows:
+            out[status_name] = int(n)
+        return out
+
+    chunk_rows = (await session.execute(chunks_counts_q)).all()
+    job_rows = (await session.execute(jobs_counts_q)).all()
+    task_rows = (await session.execute(tasks_counts_q)).all()
+
+    return {
+        "id": sweep_row.id,
+        "name": sweep_row.name,
+        "status": sweep_row.status,
+        "finalized_by": sweep_row.finalized_by,
+        "total_chunks": sweep_row.total_chunks,
+        "total_jobs": sweep_row.total_jobs,
+        "total_tasks": sweep_row.total_tasks,
+        "chunks": _bucket(chunk_rows),
+        "jobs": _bucket(job_rows),
+        "tasks": _bucket(task_rows),
+    }
+
+
 def get_sweep_sync(session: Session, sweep_id: int) -> Sweep | None:
     stmt = (
         select(Sweep)

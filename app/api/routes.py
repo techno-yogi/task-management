@@ -13,8 +13,9 @@ from app.schemas.job import (
     SweepLaunchResponse,
     SweepLaunchStatusResponse,
     SweepRead,
+    SweepStatusResponse,
 )
-from app.services.job_service import create_sweep_async, get_sweep_async
+from app.services.job_service import create_sweep_async, get_sweep_async, get_sweep_status_async
 from app.tasks import launch_sweep_workflow
 
 router = APIRouter(tags=["sweeps"])
@@ -37,6 +38,24 @@ async def get_sweep(sweep_id: int, session: AsyncSession = Depends(get_async_ses
     if sweep is None:
         raise HTTPException(status_code=404, detail="Sweep not found")
     return SweepRead.model_validate(sweep)
+
+
+@router.get("/sweeps/{sweep_id}/status", response_model=SweepStatusResponse)
+async def get_sweep_status(
+    sweep_id: int, session: AsyncSession = Depends(get_async_session)
+) -> SweepStatusResponse:
+    """Cheap status snapshot — sweep header + per-status counts at every level.
+
+    Polling clients (dashboards, the stress harness) should prefer this over
+    `GET /sweeps/{id}`, which eager-loads the full chunk/job/task graph and
+    becomes the dominant DB cost on large sweeps. This endpoint runs four
+    indexed lookups (one header + three GROUP BYs) and returns in single-digit
+    milliseconds even for 50k-task sweeps.
+    """
+    snapshot = await get_sweep_status_async(session, sweep_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    return SweepStatusResponse.model_validate(snapshot)
 
 
 @router.post("/sweeps/{sweep_id}/launch", response_model=SweepLaunchResponse)

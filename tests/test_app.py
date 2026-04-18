@@ -70,6 +70,47 @@ def test_full_sweep_execution_with_eager_celery(client, sync_session_factory, ea
 
 
 
+def test_sweep_status_endpoint_initial_counts_are_all_pending(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=2, jobs_per_chunk=2, tasks_per_job=3)
+    ).json()
+
+    response = client.get(f"/sweeps/{sweep['id']}/status")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["id"] == sweep["id"]
+    assert body["status"] == "pending"
+    assert body["total_chunks"] == 2
+    assert body["total_jobs"] == 4
+    assert body["total_tasks"] == 12
+    # Every level starts entirely pending; no rows in any other status bucket.
+    assert body["chunks"] == {"pending": 2, "running": 0, "done": 0, "failed": 0}
+    assert body["jobs"] == {"pending": 4, "running": 0, "done": 0, "failed": 0}
+    assert body["tasks"] == {"pending": 12, "running": 0, "done": 0, "failed": 0}
+
+
+def test_sweep_status_endpoint_after_eager_run_is_all_done(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=2, jobs_per_chunk=2, tasks_per_job=3)
+    ).json()
+
+    launch = client.post(f"/sweeps/{sweep['id']}/launch")
+    assert launch.status_code == 200
+
+    body = client.get(f"/sweeps/{sweep['id']}/status").json()
+    assert body["status"] == "done"
+    assert body["finalized_by"] is not None
+    assert body["chunks"]["done"] == 2 and body["chunks"]["pending"] == 0
+    assert body["jobs"]["done"] == 4 and body["jobs"]["pending"] == 0
+    assert body["tasks"]["done"] == 12 and body["tasks"]["pending"] == 0
+
+
+def test_sweep_status_endpoint_returns_404_for_unknown_sweep(client):
+    response = client.get("/sweeps/999999/status")
+    assert response.status_code == 404
+
+
 def test_metrics_and_db_diagnostics_work_in_eager_mode(client, eager_celery, make_payload):
     sweep = client.post('/sweeps', json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)).json()
     launch = client.post(f"/sweeps/{sweep['id']}/launch")
