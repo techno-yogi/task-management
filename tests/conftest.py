@@ -79,6 +79,16 @@ def truncate_tables(sync_session_factory):
         session.query(Chunk).delete()
         session.query(Sweep).delete()
         session.commit()
+
+    # Reset the in-memory per-sweep launch rate-limit bucket so tests don't
+    # leak rate-limit state into each other (sweep_id is auto-generated and
+    # may collide across tests).
+    try:
+        from app.api.routes import _launch_window  # type: ignore[attr-defined]
+
+        _launch_window.clear()
+    except Exception:
+        pass
     yield
 
 

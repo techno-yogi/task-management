@@ -35,6 +35,53 @@ router = APIRouter(tags=["sweeps"])
 log = logging.getLogger("app.api.routes")
 
 
+# --- per-sweep launch rate limiter (in-memory token bucket) -----------------
+# Single-process semantics — fine for our 1× API replica deployment. With
+# multiple API replicas, swap this for a Redis-backed token bucket (issue
+# tracked in docs/ROADMAP.md). Kept simple and dependency-free intentionally.
+import threading
+import time as _time
+
+_launch_lock = threading.Lock()
+_launch_window: dict[int, list[float]] = {}
+
+
+def _check_launch_rate_limit(sweep_id: int) -> None:
+    rate = settings.launch_rate_limit_per_window
+    if rate <= 0:
+        return
+    window = settings.launch_rate_limit_window_seconds
+    now = _time.monotonic()
+    with _launch_lock:
+        bucket = _launch_window.setdefault(sweep_id, [])
+        # drop tokens older than the window
+        cutoff = now - window
+        del bucket[: max(0, _bisect_right(bucket, cutoff))]
+        if len(bucket) >= rate:
+            retry_after = max(0.0, window - (now - bucket[0]))
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"too many launches for sweep {sweep_id}: "
+                    f"limit {rate} per {window:g}s; retry in {retry_after:.1f}s"
+                ),
+                headers={"Retry-After": f"{retry_after:.1f}"},
+            )
+        bucket.append(now)
+
+
+def _bisect_right(sorted_list: list[float], cutoff: float) -> int:
+    """Return the first index whose value is > cutoff (drop everything before)."""
+    lo, hi = 0, len(sorted_list)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_list[mid] <= cutoff:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe — is the API process up? Always returns 200.
@@ -149,6 +196,30 @@ async def list_sweeps(
 
 @router.post("/sweeps", response_model=SweepRead, status_code=status.HTTP_201_CREATED)
 async def create_sweep(payload: SweepCreate, session: AsyncSession = Depends(get_async_session)) -> SweepRead:
+    """Create a sweep graph.
+
+    Enforces hard size quotas (configurable via `APP_MAX_CHUNKS_PER_SWEEP` /
+    `APP_MAX_JOBS_PER_SWEEP` / `APP_MAX_TASKS_PER_SWEEP`) before the bulk
+    insert hits the DB so an accidental 1M-task post 422s instead of OOMing.
+    """
+    n_chunks = len(payload.chunks)
+    n_jobs = sum(len(c.jobs) for c in payload.chunks)
+    n_tasks = sum(len(j.tasks) for c in payload.chunks for j in c.jobs)
+    if n_chunks > settings.max_chunks_per_sweep:
+        raise HTTPException(
+            status_code=422,
+            detail=f"sweep has {n_chunks} chunks, exceeds limit of {settings.max_chunks_per_sweep}",
+        )
+    if n_jobs > settings.max_jobs_per_sweep:
+        raise HTTPException(
+            status_code=422,
+            detail=f"sweep has {n_jobs} jobs, exceeds limit of {settings.max_jobs_per_sweep}",
+        )
+    if n_tasks > settings.max_tasks_per_sweep:
+        raise HTTPException(
+            status_code=422,
+            detail=f"sweep has {n_tasks} tasks, exceeds limit of {settings.max_tasks_per_sweep}",
+        )
     sweep = await create_sweep_async(session, payload)
     return SweepRead.model_validate(sweep)
 
@@ -185,8 +256,9 @@ def start_sweep(
     from_chunk: int = Query(1, ge=1, description="1-indexed chunk ordinal to start from. Already-done chunks are skipped."),
 ) -> SweepLaunchResponse:
     # Sequential chunk dispatcher (one chunk at a time). Returns immediately with the
-    # dispatcher's task id; clients poll GET /sweeps/{id} for status='done'. Pass
+    # dispatcher's task id; clients poll GET /sweeps/{id}/status for status='done'. Pass
     # ?from_chunk=K to resume a large sweep from a specific chunk ordinal.
+    _check_launch_rate_limit(sweep_id)
     result = launch_sweep_workflow(sweep_id, from_ordinal=from_chunk)
     response_status = "queued"
     # Read live conf rather than `settings` so test fixtures that flip eager mode at runtime

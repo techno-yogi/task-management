@@ -257,6 +257,43 @@ def test_list_sweeps_paginates_and_filters_by_status(client, eager_celery, make_
     assert {p["id"] for p in page1["items"]}.isdisjoint({p["id"] for p in page2["items"]})
 
 
+def test_create_sweep_rejects_oversize_payload(client, eager_celery, monkeypatch):
+    """Quotas reject sweep payloads larger than configured limits with 422
+    BEFORE the bulk insert runs."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "max_chunks_per_sweep", 2)
+    payload = {
+        "name": "oversize",
+        "chunks": [
+            {"ordinal": i + 1, "jobs": [{"name": "j", "tasks": [{"point_idx": 0, "name": "t", "expected_value": 0}]}]}
+            for i in range(5)
+        ],
+    }
+    response = client.post("/sweeps", json=payload)
+    assert response.status_code == 422
+    assert "exceeds limit" in response.json()["detail"]
+
+
+def test_launch_rate_limit_blocks_excessive_calls(client, eager_celery, make_payload, monkeypatch):
+    """Token bucket: more than N launches per window for one sweep ⇒ 429 + Retry-After."""
+    from app.config import settings as _settings
+
+    # Tighten the bucket to a deterministic shape for the test.
+    monkeypatch.setattr(_settings, "launch_rate_limit_per_window", 2)
+    monkeypatch.setattr(_settings, "launch_rate_limit_window_seconds", 5.0)
+
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1, base_seed=99)
+    ).json()
+
+    assert client.post(f"/sweeps/{sweep['id']}/launch").status_code == 200
+    assert client.post(f"/sweeps/{sweep['id']}/launch").status_code == 200
+    third = client.post(f"/sweeps/{sweep['id']}/launch")
+    assert third.status_code == 429
+    assert "Retry-After" in third.headers
+
+
 def test_failures_endpoint_returns_empty_for_clean_sweep(client, eager_celery, make_payload):
     sweep = client.post(
         "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)

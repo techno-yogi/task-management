@@ -56,5 +56,22 @@ class Settings(BaseSettings):
     # Sync endpoints (/launch, /diagnostics) run in AnyIO's thread pool; raise under many concurrent launches.
     sync_thread_pool_capacity: int = 128
 
+    # Number of Kombu broker connections to pre-acquire on API startup. Without
+    # prewarm, the first burst of concurrent launches each pay TCP+TLS+AUTH on
+    # a cold pool. Set to 0 to disable. Recommended: target ~= peak expected
+    # concurrent /launch callers (default 32 covers most dashboards).
+    broker_prewarm_count: int = 32
+
+    # Per-sweep launch rate limit (token bucket): allow N launches per WINDOW seconds.
+    # Set rate=0 to disable. Implemented in-memory in app/api/routes.py.
+    launch_rate_limit_per_window: int = 4
+    launch_rate_limit_window_seconds: float = 5.0
+
+    # Sweep creation quotas — reject sweep payloads larger than this with 422
+    # before they hit the DB. Protects the API from accidental 1M-task posts.
+    max_chunks_per_sweep: int = 10_000
+    max_jobs_per_sweep: int = 200_000
+    max_tasks_per_sweep: int = 2_000_000
+
 
 settings = Settings()
