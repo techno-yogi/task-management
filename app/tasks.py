@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any
 
-from celery import chain, chord
+from celery import Task, chain, chord
 
 from app.celery_app import celery_app
 from app.config import settings
@@ -17,6 +17,7 @@ from app.services.job_service import (
     finalize_sweep,
     get_job_sync,
     list_sweep_chunks_summary,
+    record_task_failure,
     reset_sweep_for_relaunch,
     start_chunk,
     start_job,
@@ -58,7 +59,43 @@ def identify_sweep_finalize_worker(self) -> dict[str, Any]:
     return {"worker": getattr(self.request, "hostname", None), "task_id": getattr(self.request, "id", None)}
 
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+class _ExecuteTaskBase(Task):
+    """Base class for execute_task_variant. Hooks `on_failure` so that when
+    a task exhausts its retries (or fails with a non-retried exception class),
+    we record the terminal failure to the DB. This is the "DLQ surface" on
+    the Redis broker: failed task_variant rows are queryable via
+    GET /sweeps/{id}/failures and replayable via POST /sweeps/{id}/launch?from_chunk=K.
+    """
+
+    abstract = True
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        try:
+            variant_id = args[0] if args else kwargs.get("task_id")
+            if variant_id is None:
+                return
+            with SyncSessionLocal() as session:
+                record_task_failure(
+                    session,
+                    task_id=int(variant_id),
+                    error_message=f"error: {type(exc).__name__}: {exc}",
+                    processed_by=getattr(self.request, "hostname", None),
+                    celery_task_id=task_id,
+                )
+        except Exception:
+            # Never let a DLQ-recording failure mask the original exception
+            # or crash the worker. The exception is still raised by Celery
+            # and counted in celery_task_failed_total.
+            pass
+
+
+@celery_app.task(
+    bind=True,
+    base=_ExecuteTaskBase,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=3,
+)
 def execute_task_variant(self, task_id: int) -> dict[str, Any]:
     with SyncSessionLocal() as session:
         task = start_task(session, task_id)
@@ -93,7 +130,7 @@ def execute_task_variant(self, task_id: int) -> dict[str, Any]:
         }
 
 
-@celery_app.task(bind=True)
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def finalize_job_task(self, results: list[dict[str, Any]], job_id: int) -> dict[str, Any]:
     worker_name = getattr(self.request, "hostname", None)
     with SyncSessionLocal() as session:
@@ -107,7 +144,7 @@ def finalize_job_task(self, results: list[dict[str, Any]], job_id: int) -> dict[
         }
 
 
-@celery_app.task(bind=True)
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def finalize_chunk_task(self, results: list[dict[str, Any]], chunk_id: int) -> dict[str, Any]:
     worker_name = getattr(self.request, "hostname", None)
     with SyncSessionLocal() as session:
@@ -121,7 +158,7 @@ def finalize_chunk_task(self, results: list[dict[str, Any]], chunk_id: int) -> d
         }
 
 
-@celery_app.task(bind=True)
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def finalize_sweep_task(self, results: list[dict[str, Any]], sweep_id: int) -> dict[str, Any]:
     worker_name = getattr(self.request, "hostname", None)
     with SyncSessionLocal() as session:
@@ -168,7 +205,7 @@ def _build_chunk_chord(sweep_id: int, chunk_id: int, ordinal: int):
     return chord(job_chords, callback, app=celery_app)
 
 
-@celery_app.task(bind=True)
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def dispatch_next_chunk_task(self, sweep_id: int, chunk_ordinal: int) -> dict[str, Any]:
     """Sequential chunk dispatcher. Runs ONE chunk at a time:
       - skips chunks already status='done' (resume support)

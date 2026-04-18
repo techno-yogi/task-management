@@ -104,6 +104,27 @@ class SweepStatusResponse(BaseModel):
     tasks: StatusCounts
 
 
+class FailedTaskRead(BaseModel):
+    """One row in the DLQ view (GET /sweeps/{id}/failures)."""
+
+    task_id: int
+    job_id: int
+    point_idx: int
+    name: str
+    expected_value: int
+    actual_value: int | None
+    validation_message: str | None
+    processed_by: str | None
+    celery_task_id: str | None
+    updated_at: str | None
+
+
+class SweepFailuresResponse(BaseModel):
+    sweep_id: int
+    count: int
+    failures: list[FailedTaskRead]
+
+
 class SweepLaunchResponse(BaseModel):
     sweep_id: int
     status: str

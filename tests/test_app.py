@@ -11,6 +11,7 @@ from app.services.job_service import (
     StaleTaskStateError,
     complete_task,
     count_statuses,
+    record_task_failure,
     start_task,
 )
 
@@ -197,6 +198,56 @@ def test_complete_task_double_call_only_one_winner(client, sync_session_factory,
         assert row.processed_by == "w1"
         assert row.celery_task_id == "c1"
         assert row.status == "done"
+
+
+def test_failures_endpoint_returns_empty_for_clean_sweep(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)
+    ).json()
+    client.post(f"/sweeps/{sweep['id']}/launch")
+
+    body = client.get(f"/sweeps/{sweep['id']}/failures").json()
+    assert body["sweep_id"] == sweep["id"]
+    assert body["count"] == 0
+    assert body["failures"] == []
+
+
+def test_failures_endpoint_surfaces_recorded_dlq_rows(client, sync_session_factory, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=3)
+    ).json()
+    task_ids = [t["id"] for t in sweep["chunks"][0]["jobs"][0]["tasks"]]
+
+    # Simulate the on_failure path: task #1 hit retries-exhausted with an exception,
+    # task #2 is still pending (clean), task #3 ran and produced a validation mismatch.
+    with sync_session_factory() as session:
+        record_task_failure(
+            session,
+            task_id=task_ids[0],
+            error_message="error: RuntimeError: simulated",
+            processed_by="test-worker",
+            celery_task_id="celery-1",
+        )
+        # Mismatch path: start + complete with non-matching expected value.
+        start_task(session, task_ids[2])
+    with sync_session_factory() as session:
+        complete_task(
+            session,
+            task_id=task_ids[2],
+            actual_value=999,
+            expected_value=0,
+            validation_message="validation mismatch",
+            processed_by="test-worker",
+            celery_task_id="celery-3",
+        )
+
+    body = client.get(f"/sweeps/{sweep['id']}/failures").json()
+    assert body["count"] == 2
+    messages = {row["validation_message"] for row in body["failures"]}
+    assert any(m and m.startswith("error:") for m in messages)
+    assert "validation mismatch" in messages
+    # Pending task is NOT in the failures view.
+    assert task_ids[1] not in {row["task_id"] for row in body["failures"]}
 
 
 def test_metrics_and_db_diagnostics_work_in_eager_mode(client, eager_celery, make_payload):

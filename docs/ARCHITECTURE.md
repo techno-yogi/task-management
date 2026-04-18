@@ -165,14 +165,48 @@ respectively). Two non-default settings matter:
 * Pluggable scale knobs: every queue has its own worker tier so you can scale
   the bottleneck without scaling the rest.
 
-## 9. Known boundaries
+## 9. Failure handling and the DLQ surface
+
+Redis-as-broker has no native dead-letter exchange. Our DLQ is the database:
+
+* `task_acks_late=True` — workers ack only after the task body returns.
+* `task_reject_on_worker_lost=True` — a SIGKILL'd worker's in-flight messages
+  are requeued by the broker, not silently lost. This is the actual
+  at-least-once delivery guarantee.
+* `execute_task_variant.autoretry_for=(Exception,), max_retries=3` — transient
+  failures retry with exponential backoff.
+* `execute_task_variant.on_failure` — when retries are exhausted (or a
+  non-retried exception class is raised), `record_task_failure` writes
+  `status='failed', validation_message='error: <ExcType>: <msg>'` to the
+  task row.
+* `finalize_{job,chunk,sweep}_task` and `dispatch_next_chunk_task` also have
+  `autoretry_for=(Exception,), max_retries=5` so a transient PG/Redis blip on
+  the cascade critical path doesn't strand a chord forever.
+* `GET /sweeps/{id}/failures` returns the DLQ view — both retries-exhausted
+  (`error: ...`) and clean validation mismatches (`validation mismatch`).
+  Replay path: fix root cause + `POST /sweeps/{id}/launch?from_chunk=K`.
+
+We deliberately **did not** set `task_acks_on_failure_or_timeout=False` (the
+roadmap's original P0-1 idea). On Redis that setting would create a poison-pill
+retry storm once `max_retries` is exhausted. The DB-side DLQ is safer and
+more queryable.
+
+## 10. Atomic state transitions
+
+`complete_task` uses
+`UPDATE … WHERE id=:id AND status='running' RETURNING *`. If the WHERE clause
+matches 0 rows it raises `StaleTaskStateError` (subclass of `RuntimeError`),
+which the autoretry decorator catches and re-delivers. This makes duplicate
+deliveries (acks_late + worker death) and concurrent reset-vs-complete races
+guaranteed-safe regardless of task-body idempotency.
+
+## 11. Known boundaries
 
 * `GET /sweeps/{id}` eagerly loads the entire graph (chunks + jobs + tasks).
-  At 50 k tasks per sweep this is ~50 k rows per poll and dominates DB time
-  under aggressive polling. See `docs/ROADMAP.md` for the planned lightweight
-  status endpoint.
-* No row-level locking on state transitions — relies on idempotent task bodies
-  for safety. Adequate for the current task semantics; would need
-  `SELECT … FOR UPDATE` for non-idempotent business logic.
+  Use `GET /sweeps/{id}/status` for polling — it runs three indexed GROUP BYs
+  and stays in single-digit-ms regardless of sweep size.
+* No row-level locking on state transitions — instead we rely on the atomic
+  conditional UPDATE pattern (see §10). Adequate for our task semantics;
+  non-idempotent task bodies would still want `SELECT … FOR UPDATE`.
 * Single-region: no replicas, no horizontal Postgres sharding. Cluster-wide
   ceiling = single Postgres can handle (≈ 600 conns × write QPS).

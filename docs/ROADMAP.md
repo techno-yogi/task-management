@@ -8,56 +8,61 @@ change**, and the **verification** (how we’ll know it worked).
 
 ## P0 — Critical correctness / safety
 
-### P0-1. Add `acks_on_failure_or_timeout=False` to `execute_task_variant`
+### ✅ P0-1. Failure handling: `task_reject_on_worker_lost` + DB-backed DLQ
 
-**Problem.** Today `task_acks_late=True` is on, but if `execute_task_variant`
-fails *and* exhausts retries, Celery acks the message. With `complete_task`
-crashing late in the cycle (e.g. PG outage during update) the task can be
-silently lost.
+**Status.** Done — branch `improvements/p0`.
 
-**Change.** Set `acks_on_failure_or_timeout=False` on the execute task **and**
-the finalize tasks. Combined with bounded `max_retries`, failed tasks land in
-the broker dead-letter (per-queue `x-dead-letter-exchange`) for replay rather
-than disappearing.
+**Original idea.** Set `task_acks_on_failure_or_timeout=False` so failed tasks
+land in a broker dead-letter for replay.
 
-**Verify.** Inject `raise RuntimeError` 100 % of the time in `_compute_actual_value`
-for one chunk, run a sweep; confirm those task IDs appear in the DLX queue and
-re-running them clears `failed` rows.
+**Why we changed direction.** Redis (our broker) has no native
+`x-dead-letter-exchange`. Setting `acks_on_failure_or_timeout=False` on Redis
++ `autoretry_for=(Exception,), max_retries=3` would create a poison-pill: once
+retries are exhausted, the message is requeued, fails again, requeues, …
 
-### P0-2. Replace per-task race in `start_task → complete_task` with a single UPDATE
+**What shipped.**
 
-**Problem.** Today two separate sessions touch a `TaskVariant`:
-1. `start_task`: `SELECT … FOR UPDATE`-less read, then update to `running`.
-2. `complete_task`: read again, write `done`.
+* `task_reject_on_worker_lost=True` globally — closes the SIGKILL hole
+  (worker killed mid-task ⇒ broker requeues, not silently acks). This is the
+  actual at-least-once delivery guarantee under acks_late.
+* `execute_task_variant` now uses a custom `_ExecuteTaskBase` whose
+  `on_failure` hook calls `record_task_failure` to write
+  `status='failed', validation_message='error: <ExcType>: <msg>'` once retries
+  are exhausted. This is the DB-backed DLQ surface (no broker-side DLX needed).
+* `finalize_{job,chunk,sweep}_task` and `dispatch_next_chunk_task` get
+  `autoretry_for=(Exception,), max_retries=5` so a transient PG/Redis blip on
+  the cascade critical path doesn't strand a chord forever.
+* New `GET /sweeps/{id}/failures` endpoint returns the DLQ view — both
+  retries-exhausted failures (`error: …`) and clean validation mismatches.
 
-Between (1) and (2) the row could be reset by `reset_sweep_for_relaunch`,
-re-claimed by another worker, etc. Idempotent value computation hides this for
-now, but a non-idempotent task body would corrupt.
+**Verify.** Unit tests cover the empty case, the recorded-DLQ case (mixed
+exhausted-retries + validation-mismatch), and confirm pending tasks don't
+appear. End-to-end inject test (10×always-raise on one chunk) is queued
+under "Validation #12" — see VALIDATION.md TODO.
 
-**Change.** Single `UPDATE … WHERE id=:id AND status='running' RETURNING *` for
-the completion path. If 0 rows updated, raise → autoretry kicks in.
+### ✅ P0-2. Atomic `complete_task` transition + StaleTaskStateError
 
-**Verify.** Existing tests + a new race test that calls `complete_task` twice
-concurrently and asserts only one wins.
+**Status.** Done — branch `improvements/p0`.
 
-### P0-3. `/sweeps/{id}` must not eagerly load the full graph
+`complete_task` now does a single
+`UPDATE … WHERE id=:id AND status='running' RETURNING *`; raises
+`StaleTaskStateError` if 0 rows updated, which the existing
+`autoretry_for=(Exception,)` policy on `execute_task_variant` catches and
+re-delivers. Caller passes `expected_value` explicitly. Three new unit tests
+cover happy path, stale, and double-call (first writer wins, second raises).
 
-**Problem.** Each `GET /sweeps/{id}` selectin-loads all chunks, jobs, and tasks.
-Polling clients (the stress harness, dashboards, watchers) hit this every
-0.5–1 s. At 50 k tasks per sweep that’s ~50 k rows per poll. We measured this
-as the dominant cost during the heavy stress test (Postgres CPU spent in the
-`task_variants` index range scan).
+### ✅ P0-3. Lightweight `GET /sweeps/{id}/status` endpoint
 
-**Change.** Two endpoints:
+**Status.** Done — branch `improvements/p0`.
 
-* `GET /sweeps/{id}/status` — returns `{id, status, total_*, counts_by_status}`
-  computed via a single `SELECT count(*) FILTER (WHERE status=…)` per level
-  (one round-trip, ~3 ms).
-* `GET /sweeps/{id}` — keep eager-load behavior but cap depth via query params
-  (`?include=chunks` / `?include=jobs` / `?include=tasks`).
+Returns sweep header + per-status counts at every level via three indexed
+GROUP BY queries. Cost stays in single-digit ms for 50k-task sweeps.
+Polling clients (stress harness, dashboards) should switch from
+`GET /sweeps/{id}` to `/status`. Three new unit tests cover initial, post-run,
+and 404 paths.
 
-**Verify.** Replay validations 7 + 8 against `/status`; confirm DB CPU drops
-significantly while wall-clock numbers don’t regress.
+**Follow-up.** Wire the stress harness over to `/status` and re-run validations
+7 + 8 to quantify the DB CPU drop. Tracked in P2-5 below.
 
 ---
 
@@ -150,6 +155,12 @@ Document explicit `--scale` targets per workload class:
 
 A single `complete_task` does two UPDATEs (start + complete) plus one each for
 `finalize_job/chunk`. Compress to one update per state change with `RETURNING`.
+
+### P2-5. Migrate stress harness + dashboards to `/sweeps/{id}/status`
+
+Now that the lightweight endpoint exists (P0-3), update `docker_stress_test.py`
+and any polling clients to use `/status` instead of `/sweeps/{id}`. Re-run
+validations 7 + 8; quantify the DB CPU drop on the 50k-task heavy benchmark.
 
 ---
 

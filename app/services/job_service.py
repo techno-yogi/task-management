@@ -237,6 +237,86 @@ def complete_task(
     return row
 
 
+def record_task_failure(
+    session: Session,
+    task_id: int,
+    error_message: str,
+    processed_by: str | None,
+    celery_task_id: str | None,
+) -> None:
+    """Record a terminal task failure (post-retries) into the DB.
+
+    This is the "DLQ surface" given the Redis broker has no native DLX:
+    failed task_variant rows are queryable via GET /sweeps/{id}/failures
+    and replayable via POST /sweeps/{id}/launch?from_chunk=K.
+
+    Idempotent — uses a single UPDATE with no status filter so it works
+    whether the row was 'running' (normal failure) or 'pending' (failed
+    before start_task could flip it).
+    """
+    stmt = (
+        update(TaskVariant)
+        .where(TaskVariant.id == task_id)
+        .values(
+            status="failed",
+            validation_message=error_message[:200],
+            processed_by=processed_by,
+            celery_task_id=celery_task_id,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.execute(stmt)
+    session.commit()
+
+
+def list_sweep_failures(session: Session, sweep_id: int) -> list[dict[str, Any]]:
+    """Return all failed task_variants for a sweep (the DLQ view).
+
+    A row with status='failed' and validation_message starting with 'error: '
+    indicates an exhausted-retries Celery failure (recorded by the
+    on_failure hook). A row with validation_message='validation mismatch'
+    indicates a successful run whose actual_value didn't match expected_value.
+    """
+    stmt = (
+        select(
+            TaskVariant.id,
+            TaskVariant.job_id,
+            TaskVariant.point_idx,
+            TaskVariant.name,
+            TaskVariant.expected_value,
+            TaskVariant.actual_value,
+            TaskVariant.validation_message,
+            TaskVariant.processed_by,
+            TaskVariant.celery_task_id,
+            TaskVariant.updated_at,
+        )
+        .where(
+            TaskVariant.status == "failed",
+            TaskVariant.job_id.in_(
+                select(Job.id).where(
+                    Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id))
+                )
+            ),
+        )
+        .order_by(TaskVariant.updated_at.desc())
+    )
+    return [
+        {
+            "task_id": row.id,
+            "job_id": row.job_id,
+            "point_idx": row.point_idx,
+            "name": row.name,
+            "expected_value": row.expected_value,
+            "actual_value": row.actual_value,
+            "validation_message": row.validation_message,
+            "processed_by": row.processed_by,
+            "celery_task_id": row.celery_task_id,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in session.execute(stmt).all()
+    ]
+
+
 def start_job(session: Session, job_id: int) -> Job:
     job = get_job_sync(session, job_id)
     if job is None:
