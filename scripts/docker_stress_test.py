@@ -239,6 +239,11 @@ async def main() -> int:
                     raise TimeoutError(f"sweep {sid} did not finish: status={data['status']}")
                 await asyncio.sleep(args.poll_interval)
 
+        # Track task-level progress aggregated across all sweeps so we can see
+        # work rate even when no individual sweep has hit `done` yet (a 500-task
+        # sweep can sit at status='pending' for 20s while still doing 350 tasks).
+        last_task_count = {"v": 0}
+
         async def monitor() -> None:
             while not stop_monitor.is_set():
                 try:
@@ -250,10 +255,34 @@ async def main() -> int:
                 delta_t = now - last_print["t"]
                 delta_c = count - last_print["count"]
                 sweeps_per_s = delta_c / delta_t if delta_t > 0 else 0.0
-                tasks_per_s = sweeps_per_s * expected_total
-                # Connection-pool diagnostics: snapshot SQLAlchemy pool counters and
-                # per-state pg_stat_activity counts so we can see if connections leak
-                # or grow unboundedly under load.
+
+                # Cheap aggregate: sum tasks.done across all our sweeps via /status.
+                # 500-sweep N=100 sample is fine — /status is single-digit ms each.
+                # We sample a fixed quorum (50 sweeps spread across the range) rather
+                # than all of them, to keep monitor overhead bounded.
+                sample_ids = sweep_ids[:: max(1, len(sweep_ids) // 50)]
+                tasks_done_total = 0
+                tasks_running_total = 0
+                try:
+                    snaps = await asyncio.gather(
+                        *[client.get(f"/sweeps/{sid}/status", timeout=5.0) for sid in sample_ids],
+                        return_exceptions=True,
+                    )
+                    valid = [s for s in snaps if not isinstance(s, BaseException) and s.status_code == 200]
+                    for s in valid:
+                        d = s.json()
+                        tasks_done_total += d["tasks"]["done"]
+                        tasks_running_total += d["tasks"]["running"]
+                    # Extrapolate to full population.
+                    if valid:
+                        scale = len(sweep_ids) / len(valid)
+                        tasks_done_total = int(tasks_done_total * scale)
+                        tasks_running_total = int(tasks_running_total * scale)
+                except Exception:
+                    pass
+
+                tasks_per_s_real = (tasks_done_total - last_task_count["v"]) / delta_t if delta_t > 0 else 0.0
+
                 pool_snapshot = ""
                 try:
                     diag_resp = await client.get("/diagnostics/db", timeout=5.0)
@@ -271,12 +300,14 @@ async def main() -> int:
                     pool_snapshot = f"  diag_error={type(exc).__name__}"
                 print(
                     f"[monitor +{now - t2:6.1f}s] sweeps_done={count}/{len(sweep_ids)}"
-                    f"  rate={sweeps_per_s:6.2f} sweeps/s ({tasks_per_s:7.1f} tasks/s)"
+                    f"  tasks~done={tasks_done_total}/{total_tasks} run={tasks_running_total}"
+                    f"  rate={tasks_per_s_real:6.0f} tasks/s ({sweeps_per_s:5.2f} sweeps/s)"
                     f"{pool_snapshot}",
                     flush=True,
                 )
                 last_print["t"] = now
                 last_print["count"] = count
+                last_task_count["v"] = tasks_done_total
 
         t2 = time.perf_counter()
         last_print["t"] = t2
