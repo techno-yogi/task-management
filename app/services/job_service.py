@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 
@@ -12,6 +12,17 @@ from app.schemas.job import SweepCreate
 
 
 SUCCESS_STATUSES = {"done"}
+
+
+class StaleTaskStateError(RuntimeError):
+    """Raised by `complete_task` when the target row was not in the expected
+    `running` state at UPDATE time. Causes Celery's `autoretry_for=(Exception,)`
+    to re-deliver the task, which will re-acquire the row via `start_task`.
+
+    Most common causes:
+      * `reset_sweep_for_relaunch` ran mid-flight and reset the row to pending.
+      * Another worker (acks_late + redelivery) already completed the row.
+    """
 
 
 def _serialize_context(shared_context: dict[str, int | str | float]) -> str:
@@ -177,21 +188,53 @@ def complete_task(
     session: Session,
     task_id: int,
     actual_value: int,
+    expected_value: int,
     validation_message: str,
     processed_by: str | None,
     celery_task_id: str | None,
 ) -> TaskVariant:
-    task = get_task_sync(session, task_id)
-    if task is None:
-        raise ValueError(f"Task {task_id} not found")
-    task.actual_value = actual_value
-    task.validation_message = validation_message
-    task.processed_by = processed_by
-    task.celery_task_id = celery_task_id
-    task.status = "done" if actual_value == task.expected_value else "failed"
+    """Atomically transition a TaskVariant from `running` to a terminal status.
+
+    Implementation: a single
+        UPDATE task_variants
+           SET status = :terminal, actual_value = ..., ...
+         WHERE id = :id AND status = 'running'
+        RETURNING *
+
+    If the WHERE clause matches 0 rows, raises `StaleTaskStateError` so the
+    Celery `autoretry_for=(Exception,)` policy on `execute_task_variant`
+    re-delivers the task. The retry path will re-call `start_task`, which is
+    idempotent, then re-attempt completion.
+
+    Why this matters: prior to this change, the read-modify-write happened in
+    Python across two SELECT/UPDATE statements, so two concurrent deliveries
+    (or a `reset_sweep_for_relaunch` interleaved with a worker) could clobber
+    each other. With the atomic UPDATE there is exactly one winner per
+    `running` -> terminal transition; everyone else gets a clean retry.
+    """
+    terminal_status = "done" if actual_value == expected_value else "failed"
+    stmt = (
+        update(TaskVariant)
+        .where(TaskVariant.id == task_id, TaskVariant.status == "running")
+        .values(
+            status=terminal_status,
+            actual_value=actual_value,
+            validation_message=validation_message,
+            processed_by=processed_by,
+            celery_task_id=celery_task_id,
+        )
+        .returning(TaskVariant)
+        .execution_options(synchronize_session=False)
+    )
+    row = session.execute(stmt).scalar_one_or_none()
     session.commit()
-    session.refresh(task)
-    return task
+    if row is None:
+        raise StaleTaskStateError(
+            f"Task {task_id} was not in 'running' state when complete_task ran "
+            "(possibly reset by relaunch or completed by another worker)."
+        )
+    session.refresh(row)
+    return row
 
 
 def start_job(session: Session, job_id: int) -> Job:

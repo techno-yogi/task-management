@@ -67,6 +67,7 @@ def execute_task_variant(self, task_id: int) -> dict[str, Any]:
             raise ValueError(f"Job {task.job_id} not found")
         sleep_seconds = _task_sleep_seconds(job.shared_context_json)
         actual_value = _compute_actual_value(job.shared_context_json, task.point_idx)
+        expected_value = task.expected_value
         worker_name = getattr(self.request, "hostname", None)
         celery_task_id = getattr(self.request, "id", None)
 
@@ -78,7 +79,8 @@ def execute_task_variant(self, task_id: int) -> dict[str, Any]:
             session,
             task_id=task_id,
             actual_value=actual_value,
-            validation_message="validated" if actual_value == task.expected_value else "validation mismatch",
+            expected_value=expected_value,
+            validation_message="validated" if actual_value == expected_value else "validation mismatch",
             processed_by=worker_name,
             celery_task_id=celery_task_id,
         )

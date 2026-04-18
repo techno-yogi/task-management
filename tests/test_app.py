@@ -7,7 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select
 
 from app.models import Chunk, Job, Sweep, TaskVariant
-from app.services.job_service import count_statuses
+from app.services.job_service import (
+    StaleTaskStateError,
+    complete_task,
+    count_statuses,
+    start_task,
+)
 
 
 def test_create_and_get_sweep_graph(client, eager_celery, make_payload):
@@ -109,6 +114,89 @@ def test_sweep_status_endpoint_after_eager_run_is_all_done(client, eager_celery,
 def test_sweep_status_endpoint_returns_404_for_unknown_sweep(client):
     response = client.get("/sweeps/999999/status")
     assert response.status_code == 404
+
+
+def _seed_one_task(client, make_payload) -> int:
+    """Create a 1-chunk/1-job/1-task sweep and return the lone task id."""
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1)
+    ).json()
+    return sweep["chunks"][0]["jobs"][0]["tasks"][0]["id"]
+
+
+def test_complete_task_is_atomic_on_running(client, sync_session_factory, make_payload):
+    """Happy path: row was 'running' -> single UPDATE flips it to 'done', returns it."""
+    task_id = _seed_one_task(client, make_payload)
+    with sync_session_factory() as session:
+        start_task(session, task_id)
+
+    with sync_session_factory() as session:
+        updated = complete_task(
+            session,
+            task_id=task_id,
+            actual_value=42,
+            expected_value=42,
+            validation_message="validated",
+            processed_by="test-worker",
+            celery_task_id="ctid-1",
+        )
+        assert updated.status == "done"
+        assert updated.actual_value == 42
+        assert updated.processed_by == "test-worker"
+
+
+def test_complete_task_raises_stale_when_row_not_running(client, sync_session_factory, make_payload):
+    """If the row isn't 'running' (e.g. reset to pending mid-flight), raise so the
+    Celery autoretry path can re-acquire and re-complete the task cleanly."""
+    task_id = _seed_one_task(client, make_payload)
+
+    with sync_session_factory() as session, pytest.raises(StaleTaskStateError):
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w",
+            celery_task_id="c",
+        )
+
+
+def test_complete_task_double_call_only_one_winner(client, sync_session_factory, make_payload):
+    """Second `complete_task` after the first one already flipped the row to terminal
+    state must raise — the row is no longer 'running'. This is the duplicate-delivery
+    safety property from acks_late + worker death."""
+    task_id = _seed_one_task(client, make_payload)
+    with sync_session_factory() as session:
+        start_task(session, task_id)
+
+    with sync_session_factory() as session:
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w1",
+            celery_task_id="c1",
+        )
+
+    with sync_session_factory() as session, pytest.raises(StaleTaskStateError):
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w2",
+            celery_task_id="c2",
+        )
+
+    with sync_session_factory() as session:
+        row = session.get(TaskVariant, task_id)
+        assert row.processed_by == "w1"
+        assert row.celery_task_id == "c1"
+        assert row.status == "done"
 
 
 def test_metrics_and_db_diagnostics_work_in_eager_mode(client, eager_celery, make_payload):
