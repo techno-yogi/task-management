@@ -1,0 +1,14 @@
+# Deploy-specific Postgres TLS Dockerfile.
+# The build context is /opt/sweep-app/docker/postgres (not the repo root), so
+# COPY paths are relative to that directory.
+
+FROM postgres:16
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY docker-entrypoint-ssl.sh /usr/local/bin/docker-entrypoint-ssl.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-ssl.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-ssl.sh"]

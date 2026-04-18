@@ -1,0 +1,71 @@
+# Stand-in "staging host" for local Ansible validation.
+#
+# Provides:
+#   * Ubuntu 22.04 base
+#   * openssh-server listening on port 22 (mapped to host :2222)
+#   * docker-ce-cli + docker-compose-plugin (the host's docker.sock is bind-
+#     mounted at runtime so `docker compose up` on this container actually
+#     drives the SAME daemon as the rest of your local environment)
+#   * a `deploy` user with passwordless sudo and the dev-staging public key
+#     baked into authorized_keys at build time
+#
+# This is a TEST FIXTURE, not a production image: passwordless sudo, a baked-
+# in pubkey, and host socket access would all be unacceptable in prod.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-server \
+      sudo \
+      python3 \
+      python3-pip \
+      ca-certificates \
+      curl \
+      gnupg \
+      rsync \
+ && install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable" \
+      > /etc/apt/sources.list.d/docker.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd
+
+# Match host docker socket gid so the deploy user can actually call dockerd
+# without a root context. `docker` group typically has gid 999/998 on Docker
+# Desktop's helper VM; create one and add deploy to it. The runtime gid is
+# patched by the entrypoint to whatever the bind-mounted socket actually has.
+RUN groupadd -g 999 docker || true \
+ && useradd -m -s /bin/bash -G sudo,docker deploy \
+ && echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/deploy \
+ && chmod 440 /etc/sudoers.d/deploy \
+ && mkdir -p /home/deploy/.ssh \
+ && chmod 700 /home/deploy/.ssh \
+ && chown -R deploy:deploy /home/deploy/.ssh
+
+# The build-context-relative path to the pubkey we want baked in. The compose
+# file ensures `keys/dev_staging_id_ed25519.pub` exists before building.
+COPY keys/dev_staging_id_ed25519.pub /home/deploy/.ssh/authorized_keys
+# Strip Windows CRLF line endings — ssh-keygen on a Windows host writes them
+# and sshd treats `... user@host\r` as a malformed (different) public key.
+RUN sed -i 's/\r$//' /home/deploy/.ssh/authorized_keys \
+ && chmod 600 /home/deploy/.ssh/authorized_keys \
+ && chown deploy:deploy /home/deploy/.ssh/authorized_keys
+
+# Tighten sshd config: no root login, key only, no PAM noise.
+RUN sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config \
+ && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+# Entrypoint: re-chown the bind-mounted docker.sock to the docker group on
+# every boot, then exec sshd in foreground.
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+
+EXPOSE 22
+CMD ["/usr/local/bin/entrypoint.sh"]

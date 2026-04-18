@@ -1,22 +1,52 @@
-version: "3.9"
+# Rendered by Ansible. Mirrors the production topology validated in the repo
+# root docker-compose.yml: a TLS-enabled Postgres (custom build), Redis, an
+# API container, and three Celery worker tiers (exec / aggregate /
+# sweep_finalize). Worker container count is controlled at `compose up` time
+# via `--scale <svc>=N` flags driven by the WORKER_*_REPLICAS env vars.
 
-x-app-env: &app_env
-  APP_ENV: ${APP_ENV}
+volumes:
+  pgdata:
+  pgssl:
+
+x-worker-env: &worker_env
   APP_ASYNC_DATABASE_URL: ${APP_ASYNC_DATABASE_URL}
+  APP_ASYNC_PG_SSL_CA_FILE: ${APP_ASYNC_PG_SSL_CA_FILE}
   APP_SYNC_DATABASE_URL: ${APP_SYNC_DATABASE_URL}
   APP_CELERY_BROKER_URL: ${APP_CELERY_BROKER_URL}
   APP_CELERY_RESULT_BACKEND: ${APP_CELERY_RESULT_BACKEND}
+  APP_SYNC_DB_POOL_SIZE: ${WORKER_SYNC_DB_POOL_SIZE:-1}
+  APP_SYNC_DB_MAX_OVERFLOW: ${WORKER_SYNC_DB_MAX_OVERFLOW:-2}
   SECRET_KEY: ${SECRET_KEY}
+
+x-worker-volumes: &worker_volumes
+  - pgssl:/etc/ssl/postgres:ro
 
 services:
   postgres:
-    image: postgres:16
+    # Custom build adds openssl + a self-signed cert generator on first boot,
+    # mounted on the shared pgssl volume so api/workers can verify-full it.
+    build:
+      context: ./docker/postgres
+      dockerfile: Dockerfile
+    command:
+      - "postgres"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_cert_file=/var/lib/postgresql/ssl/server.crt"
+      - "-c"
+      - "ssl_key_file=/var/lib/postgresql/ssl/server.key"
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS:-600}"
+      - "-c"
+      - "shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - /opt/sweep-app/postgres:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+      - pgssl:/var/lib/postgresql/ssl
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -33,8 +63,21 @@ services:
 
   api:
     image: ${APP_IMAGE}:${APP_IMAGE_TAG}
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    environment: *app_env
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - pgssl:/etc/ssl/postgres:ro
+    environment:
+      APP_ENV: ${APP_ENV}
+      APP_ASYNC_DATABASE_URL: ${APP_ASYNC_DATABASE_URL}
+      APP_ASYNC_PG_SSL_CA_FILE: ${APP_ASYNC_PG_SSL_CA_FILE}
+      APP_SYNC_DATABASE_URL: ${APP_SYNC_DATABASE_URL}
+      APP_ASYNC_DB_POOL_SIZE: ${API_ASYNC_DB_POOL_SIZE:-55}
+      APP_ASYNC_DB_MAX_OVERFLOW: ${API_ASYNC_DB_MAX_OVERFLOW:-50}
+      APP_SYNC_DB_POOL_SIZE: ${API_SYNC_DB_POOL_SIZE:-40}
+      APP_SYNC_DB_MAX_OVERFLOW: ${API_SYNC_DB_MAX_OVERFLOW:-60}
+      APP_CELERY_BROKER_URL: ${APP_CELERY_BROKER_URL}
+      APP_CELERY_RESULT_BACKEND: ${APP_CELERY_RESULT_BACKEND}
+      SECRET_KEY: ${SECRET_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,10 +87,13 @@ services:
       - "${APP_PORT}:8000"
     restart: unless-stopped
 
-  worker_1:
+  # --queues=sweep.execution, --prefetch-multiplier=1 + --disable-prefetch.
+  # Scale via WORKER_EXEC_REPLICAS at compose-up time.
+  worker_exec:
     image: ${APP_IMAGE}:${APP_IMAGE_TAG}
-    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=worker1@%h --concurrency=${CELERY_WORKER_CONCURRENCY}
-    environment: *app_env
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=exec@%h --concurrency=${CELERY_WORKER_CONCURRENCY:-8} --prefetch-multiplier=1 --disable-prefetch --queues=sweep.execution
+    volumes: *worker_volumes
+    environment: *worker_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,10 +101,13 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  worker_2:
+  # finalize_job + finalize_chunk. NO --disable-prefetch (would extend tail
+  # latency by ~60s — see comment in repo root docker-compose.yml).
+  worker_aggregate:
     image: ${APP_IMAGE}:${APP_IMAGE_TAG}
-    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=worker2@%h --concurrency=${CELERY_WORKER_CONCURRENCY}
-    environment: *app_env
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=aggregate@%h --concurrency=${CELERY_WORKER_CONCURRENCY:-8} --prefetch-multiplier=1 --queues=sweep.job.finalize,sweep.chunk.finalize
+    volumes: *worker_volumes
+    environment: *worker_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,10 +115,13 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  worker_3:
+  # finalize_sweep_task + dispatch_next_chunk_task (one per chunk per sweep,
+  # critical path — same prefetch policy as worker_aggregate).
+  worker_sweep_finalize:
     image: ${APP_IMAGE}:${APP_IMAGE_TAG}
-    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=worker3@%h --concurrency=${CELERY_WORKER_CONCURRENCY}
-    environment: *app_env
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=sweepfinal@%h --concurrency=${CELERY_WORKER_CONCURRENCY:-8} --prefetch-multiplier=1 --queues=sweep.sweep.finalize
+    volumes: *worker_volumes
+    environment: *worker_env
     depends_on:
       postgres:
         condition: service_healthy

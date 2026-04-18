@@ -1,0 +1,75 @@
+# Local stand-in for "staging" used to validate the Ansible deploy without a
+# real VM. The whole stack runs in its own compose project (`sweep-deploy-
+# test`) on its own bridge network so it never collides with the main dev
+# stack at the repo root.
+#
+# Usage:
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 init        # gen keys
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 up          # build + start
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 lint        # syntax-check
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 check       # --check --diff
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 apply       # real deploy
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 health      # curl deployed API
+#   pwsh ./deploy/dev-staging/dev_staging.ps1 down        # tear down
+
+name: sweep-deploy-test
+
+networks:
+  staging_net:
+    driver: bridge
+
+services:
+  linux_staging:
+    build:
+      context: .
+      dockerfile: Dockerfile.staging
+    hostname: linux-staging
+    networks:
+      - staging_net
+    ports:
+      # Host port 2222 -> container 22; ansible_runner reaches it as
+      # `linux_staging:22` over the shared network.
+      - "2222:22"
+    volumes:
+      # Bind-mount the host docker socket. On Windows + Docker Desktop this is
+      # the canonical path inside the linux engine VM and Just Works.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  ansible_runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    networks:
+      - staging_net
+    depends_on:
+      - linux_staging
+    volumes:
+      # Mount the whole repo so the playbook can reference docker/postgres/
+      # etc. The runner cd's to /work/deploy when executing ansible-playbook.
+      - ../../:/work
+      # SSH private key (bind-mounted from host — Windows perms come through
+      # as 0777 which OpenSSH refuses, so the entrypoint copies into /ssh-key
+      # with mode 0600 before sleeping).
+      - ./keys:/keys-mount:ro
+    environment:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+      ANSIBLE_FORCE_COLOR: "True"
+      ANSIBLE_STDOUT_CALLBACK: "yaml"
+      # Explicit roles path — the Windows bind-mounted /work/deploy is world-
+      # writable so ansible refuses to honor ansible.cfg from there.
+      ANSIBLE_ROLES_PATH: "/work/deploy/roles"
+      ANSIBLE_INTERPRETER_PYTHON: "/usr/bin/python3"
+    # Long-lived idle process — copy the bind-mounted key into a private path
+    # with strict perms (sshd / ssh refuse keys readable by group/other), then
+    # sleep so we can exec ad-hoc commands instead of `compose run --rm` per
+    # action.
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /root/.ssh
+        cp /keys-mount/dev_staging_id_ed25519 /root/.ssh/id_ed25519
+        chmod 600 /root/.ssh/id_ed25519
+        chown root:root /root/.ssh/id_ed25519
+        exec sleep infinity
+    tty: true

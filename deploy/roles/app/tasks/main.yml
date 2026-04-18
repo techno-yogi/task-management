@@ -12,15 +12,7 @@
     create_home: true
     state: present
 
-- name: Ensure application directory exists
-  ansible.builtin.file:
-    path: /opt/sweep-app
-    state: directory
-    owner: deploy
-    group: deploy
-    mode: "0750"
-
-- name: Ensure compose state directories exist
+- name: Ensure application directories exist
   ansible.builtin.file:
     path: "/opt/sweep-app/{{ item }}"
     state: directory
@@ -28,14 +20,35 @@
     group: deploy
     mode: "0750"
   loop:
-    - postgres
-    - redis
+    - ""
+    - "redis"
+    - "docker/postgres"
+
+- name: Render deploy-specific Postgres Dockerfile
+  ansible.builtin.template:
+    src: postgres-Dockerfile.j2
+    dest: /opt/sweep-app/docker/postgres/Dockerfile
+    owner: deploy
+    group: deploy
+    mode: "0640"
+
+- name: Ship custom Postgres TLS entrypoint (executable)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../docker/postgres/docker-entrypoint-ssl.sh"
+    dest: /opt/sweep-app/docker/postgres/docker-entrypoint-ssl.sh
+    owner: deploy
+    group: deploy
+    mode: "0755"
 
 - name: Log in to GHCR on target host
   community.docker.docker_login:
     registry_url: ghcr.io
     username: "{{ ghcr_username }}"
     password: "{{ ghcr_token }}"
+  when:
+    - ghcr_token is defined
+    - ghcr_token | length > 0
+    - ghcr_token != 'anonymous'
   no_log: true
 
 - name: Render application env file
@@ -55,20 +68,46 @@
     group: deploy
     mode: "0640"
 
-- name: Pull latest images
+- name: Pull / build images (best-effort — locally pre-tagged images stay)
   ansible.builtin.command:
-    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml pull
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml pull --ignore-buildable
     chdir: /opt/sweep-app
+  register: pull_result
+  failed_when: false
+  changed_when: pull_result.rc == 0
+
+- name: Build local images (postgres TLS)
+  ansible.builtin.command:
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml build postgres
+    chdir: /opt/sweep-app
+  changed_when: true
 
 - name: Apply database migrations with API image
   ansible.builtin.command:
     cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml run --rm api alembic upgrade head
     chdir: /opt/sweep-app
+  changed_when: true
 
-- name: Restart stack
+# Worker tier replica counts come from the .env file but compose doesn't
+# auto-honor a `scale:` key outside swarm mode, so we read them back here.
+- name: Read replica counts from .env
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      exec_r=$(grep -E '^WORKER_EXEC_REPLICAS=' /opt/sweep-app/.env | cut -d= -f2 | tr -d "'" | head -1)
+      agg_r=$(grep -E '^WORKER_AGGREGATE_REPLICAS=' /opt/sweep-app/.env | cut -d= -f2 | tr -d "'" | head -1)
+      fin_r=$(grep -E '^WORKER_SWEEP_FINALIZE_REPLICAS=' /opt/sweep-app/.env | cut -d= -f2 | tr -d "'" | head -1)
+      echo "--scale worker_exec=${exec_r:-2} --scale worker_aggregate=${agg_r:-1} --scale worker_sweep_finalize=${fin_r:-1}"
+  register: replica_flags_out
+  changed_when: false
+
+- name: Restart stack with scaled worker tiers
   ansible.builtin.command:
-    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml up -d --remove-orphans
+    cmd: >-
+      docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml
+      up -d --remove-orphans {{ replica_flags_out.stdout }}
     chdir: /opt/sweep-app
+  changed_when: true
 
 - name: Show running services
   ansible.builtin.command:
@@ -80,3 +119,34 @@
 - name: Print service status
   ansible.builtin.debug:
     var: compose_ps.stdout_lines
+
+# Health checks run inside the api container since the ansible controller
+# (linux_staging) can't reach the host-mapped port directly. Use python
+# since curl isn't in the slim image.
+- name: Wait for API health
+  ansible.builtin.shell:
+    cmd: >-
+      docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml exec -T api
+      python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()"
+    chdir: /opt/sweep-app
+  register: health_probe
+  retries: 30
+  delay: 2
+  until: health_probe.rc == 0
+  changed_when: false
+
+- name: Wait for API readiness
+  ansible.builtin.shell:
+    cmd: >-
+      docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml exec -T api
+      python -c "import urllib.request,json; print(urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5).read().decode())"
+    chdir: /opt/sweep-app
+  register: ready_probe
+  retries: 30
+  delay: 2
+  until: ready_probe.rc == 0
+  changed_when: false
+
+- name: Print readiness result
+  ansible.builtin.debug:
+    msg: "{{ ready_probe.stdout }}"

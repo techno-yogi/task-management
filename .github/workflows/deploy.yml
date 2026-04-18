@@ -11,7 +11,7 @@ on:
           - staging
           - production
       image_tag:
-        description: Optional image tag override
+        description: Optional image tag override (defaults to commit SHA)
         required: false
         type: string
 
@@ -67,10 +67,19 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Add target host to known_hosts
+      # Pinned host fingerprint (no TOFU). Generate once per host with:
+      #   ssh-keyscan -t ed25519,ecdsa,rsa <host>
+      # and paste the multi-line output into the SSH_KNOWN_HOSTS env secret.
+      - name: Pin target host fingerprint
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if ! grep -q . ~/.ssh/known_hosts; then
+            echo "::error::SSH_KNOWN_HOSTS secret is empty. Run ssh-keyscan against your target and store the output."
+            exit 1
+          fi
 
       - name: Install Ansible
         run: |
@@ -78,12 +87,9 @@ jobs:
           pip install "ansible>=9,<11"
           ansible-galaxy collection install -r deploy/requirements.yml
 
-      - name: Write vault password file
-        run: |
-          umask 177
-          printf '%s' "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass.txt
-
-      - name: Deploy with Ansible
+      # Render extra-vars to a YAML file rather than passing 18 -e flags. The
+      # file is created with a tight umask and deleted at the end of the job.
+      - name: Render Ansible extra-vars
         env:
           APP_IMAGE: ghcr.io/${{ github.repository }}
           APP_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
@@ -93,37 +99,55 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
           SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
           DATABASE_URL_ASYNC: ${{ secrets.DATABASE_URL_ASYNC }}
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
           APP_CELERY_BROKER_URL: ${{ secrets.APP_CELERY_BROKER_URL }}
           APP_CELERY_RESULT_BACKEND: ${{ secrets.APP_CELERY_RESULT_BACKEND }}
           WEB_CONCURRENCY: ${{ secrets.WEB_CONCURRENCY }}
-          CELERY_WORKER_COUNT: ${{ secrets.CELERY_WORKER_COUNT }}
           CELERY_WORKER_CONCURRENCY: ${{ secrets.CELERY_WORKER_CONCURRENCY }}
+          WORKER_EXEC_REPLICAS: ${{ vars.WORKER_EXEC_REPLICAS || '12' }}
+          WORKER_AGGREGATE_REPLICAS: ${{ vars.WORKER_AGGREGATE_REPLICAS || '2' }}
+          WORKER_SWEEP_FINALIZE_REPLICAS: ${{ vars.WORKER_SWEEP_FINALIZE_REPLICAS || '2' }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 177
+          python - <<'PY' > deploy_vars.yml
+          import json, os
+          out = {
+              "app_image": os.environ["APP_IMAGE"],
+              "app_image_tag": os.environ["APP_IMAGE_TAG"],
+              "app_env": os.environ["APP_ENV"],
+              "app_port": os.environ["APP_PORT"],
+              "postgres_user": os.environ["POSTGRES_USER"],
+              "postgres_password": os.environ["POSTGRES_PASSWORD"],
+              "postgres_db": os.environ["POSTGRES_DB"],
+              "secret_key": os.environ["SECRET_KEY"],
+              "database_url_async": os.environ["DATABASE_URL_ASYNC"],
+              "database_url_sync": os.environ["DATABASE_URL_SYNC"],
+              "app_celery_broker_url": os.environ["APP_CELERY_BROKER_URL"],
+              "app_celery_result_backend": os.environ["APP_CELERY_RESULT_BACKEND"],
+              "web_concurrency": os.environ["WEB_CONCURRENCY"],
+              "celery_worker_concurrency": os.environ["CELERY_WORKER_CONCURRENCY"],
+              "worker_exec_replicas": os.environ["WORKER_EXEC_REPLICAS"],
+              "worker_aggregate_replicas": os.environ["WORKER_AGGREGATE_REPLICAS"],
+              "worker_sweep_finalize_replicas": os.environ["WORKER_SWEEP_FINALIZE_REPLICAS"],
+              "ghcr_username": os.environ["GHCR_USERNAME"],
+              "ghcr_token": os.environ["GHCR_TOKEN"],
+          }
+          import json as _json
+          print(_json.dumps(out))
+          PY
+
+      - name: Deploy with Ansible
         run: |
           ansible-playbook \
             -i deploy/inventory/${{ inputs.environment }}.ini \
             deploy/playbooks/deploy.yml \
-            --vault-password-file .vault_pass.txt \
             -e target_env=${{ inputs.environment }} \
-            -e app_image="$APP_IMAGE" \
-            -e app_image_tag="$APP_IMAGE_TAG" \
-            -e app_env="$APP_ENV" \
-            -e app_port="$APP_PORT" \
-            -e postgres_user="$POSTGRES_USER" \
-            -e postgres_password="$POSTGRES_PASSWORD" \
-            -e postgres_db="$POSTGRES_DB" \
-            -e secret_key="$SECRET_KEY" \
-            -e redis_url="$REDIS_URL" \
-            -e database_url_async="$DATABASE_URL_ASYNC" \
-            -e database_url_sync="$DATABASE_URL_SYNC" \
-            -e app_celery_broker_url="$APP_CELERY_BROKER_URL" \
-            -e app_celery_result_backend="$APP_CELERY_RESULT_BACKEND" \
-            -e web_concurrency="$WEB_CONCURRENCY" \
-            -e celery_worker_count="$CELERY_WORKER_COUNT" \
-            -e celery_worker_concurrency="$CELERY_WORKER_CONCURRENCY" \
-            -e ghcr_username="$GHCR_USERNAME" \
-            -e ghcr_token="$GHCR_TOKEN"
+            -e @deploy_vars.yml
+
+      - name: Cleanup secrets on runner
+        if: always()
+        run: |
+          rm -f deploy_vars.yml ~/.ssh/known_hosts
