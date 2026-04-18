@@ -7,7 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select
 
 from app.models import Chunk, Job, Sweep, TaskVariant
-from app.services.job_service import count_statuses
+from app.services.job_service import (
+    StaleTaskStateError,
+    complete_task,
+    count_statuses,
+    record_task_failure,
+    start_task,
+)
 
 
 def test_create_and_get_sweep_graph(client, eager_celery, make_payload):
@@ -68,6 +74,180 @@ def test_full_sweep_execution_with_eager_celery(client, sync_session_factory, ea
         }
 
 
+
+
+def test_sweep_status_endpoint_initial_counts_are_all_pending(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=2, jobs_per_chunk=2, tasks_per_job=3)
+    ).json()
+
+    response = client.get(f"/sweeps/{sweep['id']}/status")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["id"] == sweep["id"]
+    assert body["status"] == "pending"
+    assert body["total_chunks"] == 2
+    assert body["total_jobs"] == 4
+    assert body["total_tasks"] == 12
+    # Every level starts entirely pending; no rows in any other status bucket.
+    assert body["chunks"] == {"pending": 2, "running": 0, "done": 0, "failed": 0}
+    assert body["jobs"] == {"pending": 4, "running": 0, "done": 0, "failed": 0}
+    assert body["tasks"] == {"pending": 12, "running": 0, "done": 0, "failed": 0}
+
+
+def test_sweep_status_endpoint_after_eager_run_is_all_done(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=2, jobs_per_chunk=2, tasks_per_job=3)
+    ).json()
+
+    launch = client.post(f"/sweeps/{sweep['id']}/launch")
+    assert launch.status_code == 200
+
+    body = client.get(f"/sweeps/{sweep['id']}/status").json()
+    assert body["status"] == "done"
+    assert body["finalized_by"] is not None
+    assert body["chunks"]["done"] == 2 and body["chunks"]["pending"] == 0
+    assert body["jobs"]["done"] == 4 and body["jobs"]["pending"] == 0
+    assert body["tasks"]["done"] == 12 and body["tasks"]["pending"] == 0
+
+
+def test_sweep_status_endpoint_returns_404_for_unknown_sweep(client):
+    response = client.get("/sweeps/999999/status")
+    assert response.status_code == 404
+
+
+def _seed_one_task(client, make_payload) -> int:
+    """Create a 1-chunk/1-job/1-task sweep and return the lone task id."""
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1)
+    ).json()
+    return sweep["chunks"][0]["jobs"][0]["tasks"][0]["id"]
+
+
+def test_complete_task_is_atomic_on_running(client, sync_session_factory, make_payload):
+    """Happy path: row was 'running' -> single UPDATE flips it to 'done', returns it."""
+    task_id = _seed_one_task(client, make_payload)
+    with sync_session_factory() as session:
+        start_task(session, task_id)
+
+    with sync_session_factory() as session:
+        updated = complete_task(
+            session,
+            task_id=task_id,
+            actual_value=42,
+            expected_value=42,
+            validation_message="validated",
+            processed_by="test-worker",
+            celery_task_id="ctid-1",
+        )
+        assert updated.status == "done"
+        assert updated.actual_value == 42
+        assert updated.processed_by == "test-worker"
+
+
+def test_complete_task_raises_stale_when_row_not_running(client, sync_session_factory, make_payload):
+    """If the row isn't 'running' (e.g. reset to pending mid-flight), raise so the
+    Celery autoretry path can re-acquire and re-complete the task cleanly."""
+    task_id = _seed_one_task(client, make_payload)
+
+    with sync_session_factory() as session, pytest.raises(StaleTaskStateError):
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w",
+            celery_task_id="c",
+        )
+
+
+def test_complete_task_double_call_only_one_winner(client, sync_session_factory, make_payload):
+    """Second `complete_task` after the first one already flipped the row to terminal
+    state must raise — the row is no longer 'running'. This is the duplicate-delivery
+    safety property from acks_late + worker death."""
+    task_id = _seed_one_task(client, make_payload)
+    with sync_session_factory() as session:
+        start_task(session, task_id)
+
+    with sync_session_factory() as session:
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w1",
+            celery_task_id="c1",
+        )
+
+    with sync_session_factory() as session, pytest.raises(StaleTaskStateError):
+        complete_task(
+            session,
+            task_id=task_id,
+            actual_value=1,
+            expected_value=1,
+            validation_message="validated",
+            processed_by="w2",
+            celery_task_id="c2",
+        )
+
+    with sync_session_factory() as session:
+        row = session.get(TaskVariant, task_id)
+        assert row.processed_by == "w1"
+        assert row.celery_task_id == "c1"
+        assert row.status == "done"
+
+
+def test_failures_endpoint_returns_empty_for_clean_sweep(client, eager_celery, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)
+    ).json()
+    client.post(f"/sweeps/{sweep['id']}/launch")
+
+    body = client.get(f"/sweeps/{sweep['id']}/failures").json()
+    assert body["sweep_id"] == sweep["id"]
+    assert body["count"] == 0
+    assert body["failures"] == []
+
+
+def test_failures_endpoint_surfaces_recorded_dlq_rows(client, sync_session_factory, make_payload):
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=3)
+    ).json()
+    task_ids = [t["id"] for t in sweep["chunks"][0]["jobs"][0]["tasks"]]
+
+    # Simulate the on_failure path: task #1 hit retries-exhausted with an exception,
+    # task #2 is still pending (clean), task #3 ran and produced a validation mismatch.
+    with sync_session_factory() as session:
+        record_task_failure(
+            session,
+            task_id=task_ids[0],
+            error_message="error: RuntimeError: simulated",
+            processed_by="test-worker",
+            celery_task_id="celery-1",
+        )
+        # Mismatch path: start + complete with non-matching expected value.
+        start_task(session, task_ids[2])
+    with sync_session_factory() as session:
+        complete_task(
+            session,
+            task_id=task_ids[2],
+            actual_value=999,
+            expected_value=0,
+            validation_message="validation mismatch",
+            processed_by="test-worker",
+            celery_task_id="celery-3",
+        )
+
+    body = client.get(f"/sweeps/{sweep['id']}/failures").json()
+    assert body["count"] == 2
+    messages = {row["validation_message"] for row in body["failures"]}
+    assert any(m and m.startswith("error:") for m in messages)
+    assert "validation mismatch" in messages
+    # Pending task is NOT in the failures view.
+    assert task_ids[1] not in {row["task_id"] for row in body["failures"]}
 
 
 def test_metrics_and_db_diagnostics_work_in_eager_mode(client, eager_celery, make_payload):

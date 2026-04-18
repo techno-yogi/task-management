@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 
@@ -12,6 +12,17 @@ from app.schemas.job import SweepCreate
 
 
 SUCCESS_STATUSES = {"done"}
+
+
+class StaleTaskStateError(RuntimeError):
+    """Raised by `complete_task` when the target row was not in the expected
+    `running` state at UPDATE time. Causes Celery's `autoretry_for=(Exception,)`
+    to re-deliver the task, which will re-acquire the row via `start_task`.
+
+    Most common causes:
+      * `reset_sweep_for_relaunch` ran mid-flight and reset the row to pending.
+      * Another worker (acks_late + redelivery) already completed the row.
+    """
 
 
 def _serialize_context(shared_context: dict[str, int | str | float]) -> str:
@@ -69,6 +80,77 @@ async def get_sweep_async(session: AsyncSession, sweep_id: int) -> Sweep | None:
     return result.scalar_one_or_none()
 
 
+async def get_sweep_status_async(session: AsyncSession, sweep_id: int) -> dict[str, Any] | None:
+    """Cheap status snapshot for a sweep: header + per-status counts at every level.
+
+    Avoids the full graph eager-load that `get_sweep_async` does. Designed to be
+    safe to poll at sub-second cadence even for sweeps with 50k+ tasks.
+
+    Returns a dict shaped like `SweepStatusResponse` (see app.schemas.job), or
+    None if the sweep doesn't exist.
+    """
+    sweep_row = (
+        await session.execute(
+            select(
+                Sweep.id,
+                Sweep.name,
+                Sweep.status,
+                Sweep.finalized_by,
+                Sweep.total_chunks,
+                Sweep.total_jobs,
+                Sweep.total_tasks,
+            ).where(Sweep.id == sweep_id)
+        )
+    ).first()
+    if sweep_row is None:
+        return None
+
+    chunks_counts_q = (
+        select(Chunk.status, func.count())
+        .where(Chunk.sweep_id == sweep_id)
+        .group_by(Chunk.status)
+    )
+    jobs_counts_q = (
+        select(Job.status, func.count())
+        .where(Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id)))
+        .group_by(Job.status)
+    )
+    tasks_counts_q = (
+        select(TaskVariant.status, func.count())
+        .where(
+            TaskVariant.job_id.in_(
+                select(Job.id).where(
+                    Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id))
+                )
+            )
+        )
+        .group_by(TaskVariant.status)
+    )
+
+    def _bucket(rows: list[tuple[str, int]]) -> dict[str, int]:
+        out = {"pending": 0, "running": 0, "done": 0, "failed": 0}
+        for status_name, n in rows:
+            out[status_name] = int(n)
+        return out
+
+    chunk_rows = (await session.execute(chunks_counts_q)).all()
+    job_rows = (await session.execute(jobs_counts_q)).all()
+    task_rows = (await session.execute(tasks_counts_q)).all()
+
+    return {
+        "id": sweep_row.id,
+        "name": sweep_row.name,
+        "status": sweep_row.status,
+        "finalized_by": sweep_row.finalized_by,
+        "total_chunks": sweep_row.total_chunks,
+        "total_jobs": sweep_row.total_jobs,
+        "total_tasks": sweep_row.total_tasks,
+        "chunks": _bucket(chunk_rows),
+        "jobs": _bucket(job_rows),
+        "tasks": _bucket(task_rows),
+    }
+
+
 def get_sweep_sync(session: Session, sweep_id: int) -> Sweep | None:
     stmt = (
         select(Sweep)
@@ -106,21 +188,133 @@ def complete_task(
     session: Session,
     task_id: int,
     actual_value: int,
+    expected_value: int,
     validation_message: str,
     processed_by: str | None,
     celery_task_id: str | None,
 ) -> TaskVariant:
-    task = get_task_sync(session, task_id)
-    if task is None:
-        raise ValueError(f"Task {task_id} not found")
-    task.actual_value = actual_value
-    task.validation_message = validation_message
-    task.processed_by = processed_by
-    task.celery_task_id = celery_task_id
-    task.status = "done" if actual_value == task.expected_value else "failed"
+    """Atomically transition a TaskVariant from `running` to a terminal status.
+
+    Implementation: a single
+        UPDATE task_variants
+           SET status = :terminal, actual_value = ..., ...
+         WHERE id = :id AND status = 'running'
+        RETURNING *
+
+    If the WHERE clause matches 0 rows, raises `StaleTaskStateError` so the
+    Celery `autoretry_for=(Exception,)` policy on `execute_task_variant`
+    re-delivers the task. The retry path will re-call `start_task`, which is
+    idempotent, then re-attempt completion.
+
+    Why this matters: prior to this change, the read-modify-write happened in
+    Python across two SELECT/UPDATE statements, so two concurrent deliveries
+    (or a `reset_sweep_for_relaunch` interleaved with a worker) could clobber
+    each other. With the atomic UPDATE there is exactly one winner per
+    `running` -> terminal transition; everyone else gets a clean retry.
+    """
+    terminal_status = "done" if actual_value == expected_value else "failed"
+    stmt = (
+        update(TaskVariant)
+        .where(TaskVariant.id == task_id, TaskVariant.status == "running")
+        .values(
+            status=terminal_status,
+            actual_value=actual_value,
+            validation_message=validation_message,
+            processed_by=processed_by,
+            celery_task_id=celery_task_id,
+        )
+        .returning(TaskVariant)
+        .execution_options(synchronize_session=False)
+    )
+    row = session.execute(stmt).scalar_one_or_none()
     session.commit()
-    session.refresh(task)
-    return task
+    if row is None:
+        raise StaleTaskStateError(
+            f"Task {task_id} was not in 'running' state when complete_task ran "
+            "(possibly reset by relaunch or completed by another worker)."
+        )
+    session.refresh(row)
+    return row
+
+
+def record_task_failure(
+    session: Session,
+    task_id: int,
+    error_message: str,
+    processed_by: str | None,
+    celery_task_id: str | None,
+) -> None:
+    """Record a terminal task failure (post-retries) into the DB.
+
+    This is the "DLQ surface" given the Redis broker has no native DLX:
+    failed task_variant rows are queryable via GET /sweeps/{id}/failures
+    and replayable via POST /sweeps/{id}/launch?from_chunk=K.
+
+    Idempotent — uses a single UPDATE with no status filter so it works
+    whether the row was 'running' (normal failure) or 'pending' (failed
+    before start_task could flip it).
+    """
+    stmt = (
+        update(TaskVariant)
+        .where(TaskVariant.id == task_id)
+        .values(
+            status="failed",
+            validation_message=error_message[:200],
+            processed_by=processed_by,
+            celery_task_id=celery_task_id,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.execute(stmt)
+    session.commit()
+
+
+def list_sweep_failures(session: Session, sweep_id: int) -> list[dict[str, Any]]:
+    """Return all failed task_variants for a sweep (the DLQ view).
+
+    A row with status='failed' and validation_message starting with 'error: '
+    indicates an exhausted-retries Celery failure (recorded by the
+    on_failure hook). A row with validation_message='validation mismatch'
+    indicates a successful run whose actual_value didn't match expected_value.
+    """
+    stmt = (
+        select(
+            TaskVariant.id,
+            TaskVariant.job_id,
+            TaskVariant.point_idx,
+            TaskVariant.name,
+            TaskVariant.expected_value,
+            TaskVariant.actual_value,
+            TaskVariant.validation_message,
+            TaskVariant.processed_by,
+            TaskVariant.celery_task_id,
+            TaskVariant.updated_at,
+        )
+        .where(
+            TaskVariant.status == "failed",
+            TaskVariant.job_id.in_(
+                select(Job.id).where(
+                    Job.chunk_id.in_(select(Chunk.id).where(Chunk.sweep_id == sweep_id))
+                )
+            ),
+        )
+        .order_by(TaskVariant.updated_at.desc())
+    )
+    return [
+        {
+            "task_id": row.id,
+            "job_id": row.job_id,
+            "point_idx": row.point_idx,
+            "name": row.name,
+            "expected_value": row.expected_value,
+            "actual_value": row.actual_value,
+            "validation_message": row.validation_message,
+            "processed_by": row.processed_by,
+            "celery_task_id": row.celery_task_id,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in session.execute(stmt).all()
+    ]
 
 
 def start_job(session: Session, job_id: int) -> Job:

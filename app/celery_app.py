@@ -58,6 +58,17 @@ celery_app.conf.update(
     accept_content=["json"],
     worker_prefetch_multiplier=settings.celery_worker_prefetch_multiplier,
     task_acks_late=settings.celery_task_acks_late,
+    # If a worker is SIGKILL'd (OOM, host reboot, container kill) mid-task, the
+    # broker requeues the message instead of silently acking it. This is the
+    # actual at-least-once delivery guarantee under acks_late. Without it, a
+    # killed worker's in-flight tasks vanish from the broker.
+    task_reject_on_worker_lost=True,
+    # NOTE: we deliberately leave `task_acks_on_failure_or_timeout=True` (the
+    # default). Setting it False on Redis would cause poison-pill retry storms
+    # once `max_retries` is exhausted (Redis has no native dead-letter exchange).
+    # Final failures are surfaced via the on_failure handler in app/tasks.py
+    # which writes to task_variants (status='failed', validation_message='error: ...');
+    # query that view via GET /sweeps/{id}/failures. See docs/ARCHITECTURE.md "DLQ".
     task_track_started=True,
     broker_transport_options=transport_options,
     result_backend_transport_options=transport_options if transport_options else {},

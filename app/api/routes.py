@@ -9,12 +9,20 @@ from app.db.sync_db import SyncSessionLocal, get_pg_stat_activity_snapshot, get_
 from app.metrics import CONTENT_TYPE_LATEST, metrics_payload
 from app.config import settings
 from app.schemas.job import (
+    FailedTaskRead,
     SweepCreate,
+    SweepFailuresResponse,
     SweepLaunchResponse,
     SweepLaunchStatusResponse,
     SweepRead,
+    SweepStatusResponse,
 )
-from app.services.job_service import create_sweep_async, get_sweep_async
+from app.services.job_service import (
+    create_sweep_async,
+    get_sweep_async,
+    get_sweep_status_async,
+    list_sweep_failures,
+)
 from app.tasks import launch_sweep_workflow
 
 router = APIRouter(tags=["sweeps"])
@@ -37,6 +45,24 @@ async def get_sweep(sweep_id: int, session: AsyncSession = Depends(get_async_ses
     if sweep is None:
         raise HTTPException(status_code=404, detail="Sweep not found")
     return SweepRead.model_validate(sweep)
+
+
+@router.get("/sweeps/{sweep_id}/status", response_model=SweepStatusResponse)
+async def get_sweep_status(
+    sweep_id: int, session: AsyncSession = Depends(get_async_session)
+) -> SweepStatusResponse:
+    """Cheap status snapshot — sweep header + per-status counts at every level.
+
+    Polling clients (dashboards, the stress harness) should prefer this over
+    `GET /sweeps/{id}`, which eager-loads the full chunk/job/task graph and
+    becomes the dominant DB cost on large sweeps. This endpoint runs four
+    indexed lookups (one header + three GROUP BYs) and returns in single-digit
+    milliseconds even for 50k-task sweeps.
+    """
+    snapshot = await get_sweep_status_async(session, sweep_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    return SweepStatusResponse.model_validate(snapshot)
 
 
 @router.post("/sweeps/{sweep_id}/launch", response_model=SweepLaunchResponse)
@@ -76,6 +102,32 @@ def get_launch_status(sweep_id: int, root_task_id: str) -> SweepLaunchStatusResp
         state=async_result.state,
         successful=successful,
         result=payload,
+    )
+
+
+@router.get("/sweeps/{sweep_id}/failures", response_model=SweepFailuresResponse)
+def get_sweep_failures(sweep_id: int) -> SweepFailuresResponse:
+    """List failed task_variants for a sweep — the DLQ view.
+
+    Two failure modes are recorded here:
+
+    * `validation_message` starts with `error:` — the task exhausted its
+      Celery retries (recorded by execute_task_variant.on_failure). This is
+      the Redis-broker DLQ surrogate.
+    * `validation_message == 'validation mismatch'` — the task ran cleanly
+      but its `actual_value` did not equal `expected_value`. Indicates a
+      logic / config bug, not infrastructure.
+
+    Replay path: fix the upstream cause, then
+    `POST /sweeps/{sweep_id}/launch?from_chunk=K` where K is the lowest
+    chunk ordinal containing failures.
+    """
+    with SyncSessionLocal() as session:
+        rows = list_sweep_failures(session, sweep_id)
+    return SweepFailuresResponse(
+        sweep_id=sweep_id,
+        count=len(rows),
+        failures=[FailedTaskRead.model_validate(r) for r in rows],
     )
 
 

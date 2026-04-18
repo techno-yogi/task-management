@@ -98,6 +98,8 @@ powershell -ExecutionPolicy Bypass -File scripts/start_local_workers.ps1 -Stop
 |---|---|---|
 | `POST` | `/sweeps` | Create a sweep graph (chunks → jobs → tasks). Async handler. |
 | `GET`  | `/sweeps/{id}` | Read full sweep graph (eager-loads chunks/jobs/tasks). Async handler. |
+| `GET`  | `/sweeps/{id}/status` | **Lightweight** sweep header + per-status counts at every level (3 GROUP BYs). Use this for high-frequency polling instead of `GET /sweeps/{id}`. |
+| `GET`  | `/sweeps/{id}/failures` | DLQ view — failed `task_variants` for the sweep (retries-exhausted + validation mismatches). |
 | `POST` | `/sweeps/{id}/launch?from_chunk=K` | Reset chunks ≥ K to pending and queue the dispatcher. Returns `{status: "queued", root_task_id}`. Sync handler (uses Celery `apply_async`). |
 | `GET`  | `/sweeps/{id}/launch/{root_task_id}` | Poll the dispatcher’s `AsyncResult` (ready/state/successful). Sync handler. |
 | `GET`  | `/diagnostics/db` | SQLAlchemy pool snapshot + `pg_stat_activity` rollup. |

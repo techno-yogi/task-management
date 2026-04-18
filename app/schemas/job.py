@@ -75,6 +75,56 @@ class SweepRead(BaseModel):
     chunks: list[ChunkRead]
 
 
+class StatusCounts(BaseModel):
+    """Per-status row counts for one level of the sweep graph."""
+
+    pending: int = 0
+    running: int = 0
+    done: int = 0
+    failed: int = 0
+
+
+class SweepStatusResponse(BaseModel):
+    """Lightweight sweep status — sweep header + per-status counts at every level.
+
+    Designed for high-frequency polling (dashboards, stress harness). Does NOT
+    eager-load chunks/jobs/tasks; cost is one O(1) sweep lookup plus one
+    GROUP BY per level (3 indexed aggregates).
+    """
+
+    id: int
+    name: str
+    status: str
+    finalized_by: str | None
+    total_chunks: int
+    total_jobs: int
+    total_tasks: int
+    chunks: StatusCounts
+    jobs: StatusCounts
+    tasks: StatusCounts
+
+
+class FailedTaskRead(BaseModel):
+    """One row in the DLQ view (GET /sweeps/{id}/failures)."""
+
+    task_id: int
+    job_id: int
+    point_idx: int
+    name: str
+    expected_value: int
+    actual_value: int | None
+    validation_message: str | None
+    processed_by: str | None
+    celery_task_id: str | None
+    updated_at: str | None
+
+
+class SweepFailuresResponse(BaseModel):
+    sweep_id: int
+    count: int
+    failures: list[FailedTaskRead]
+
+
 class SweepLaunchResponse(BaseModel):
     sweep_id: int
     status: str
