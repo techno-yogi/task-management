@@ -200,6 +200,100 @@ def test_complete_task_double_call_only_one_winner(client, sync_session_factory,
         assert row.status == "done"
 
 
+def test_request_id_middleware_round_trips_inbound_header(client):
+    """Inbound X-Request-ID is honored and echoed back in the response."""
+    custom = "test-rid-abc-123"
+    response = client.get("/health", headers={"x-request-id": custom})
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == custom
+
+
+def test_request_id_middleware_mints_one_when_absent(client):
+    """No inbound id ⇒ middleware mints a UUID hex (32 chars) and returns it."""
+    response = client.get("/health")
+    rid = response.headers.get("X-Request-ID")
+    assert rid and len(rid) == 32 and all(c in "0123456789abcdef" for c in rid)
+
+
+def test_health_ready_returns_200_when_db_is_up(client):
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["checks"]["db"]["ok"] is True
+    assert body["checks"]["broker"]["ok"] is True
+    # Sqlite test setup skips alembic check.
+    assert "skipped" in body["checks"]["alembic"]
+
+
+def test_list_sweeps_paginates_and_filters_by_status(client, eager_celery, make_payload):
+    """`GET /sweeps?status=done&limit=&offset=` returns header-only sweep summaries."""
+    pending_ids: list[int] = []
+    done_ids: list[int] = []
+    for i in range(5):
+        sweep = client.post(
+            "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1, base_seed=10_000 + i)
+        ).json()
+        if i % 2 == 0:
+            done = client.post(f"/sweeps/{sweep['id']}/launch")
+            assert done.status_code == 200
+            done_ids.append(sweep["id"])
+        else:
+            pending_ids.append(sweep["id"])
+
+    resp_all = client.get("/sweeps").json()
+    assert resp_all["total"] >= 5
+    # Header-only summaries — no chunks/jobs in response shape.
+    assert all("chunks" not in item for item in resp_all["items"])
+
+    resp_done = client.get("/sweeps?status=done").json()
+    returned_done = {item["id"] for item in resp_done["items"]}
+    assert set(done_ids).issubset(returned_done)
+    assert all(item["status"] == "done" for item in resp_done["items"])
+
+    page1 = client.get("/sweeps?limit=2&offset=0").json()
+    page2 = client.get("/sweeps?limit=2&offset=2").json()
+    assert len(page1["items"]) == 2 and len(page2["items"]) == 2
+    assert {p["id"] for p in page1["items"]}.isdisjoint({p["id"] for p in page2["items"]})
+
+
+def test_create_sweep_rejects_oversize_payload(client, eager_celery, monkeypatch):
+    """Quotas reject sweep payloads larger than configured limits with 422
+    BEFORE the bulk insert runs."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "max_chunks_per_sweep", 2)
+    payload = {
+        "name": "oversize",
+        "chunks": [
+            {"ordinal": i + 1, "jobs": [{"name": "j", "tasks": [{"point_idx": 0, "name": "t", "expected_value": 0}]}]}
+            for i in range(5)
+        ],
+    }
+    response = client.post("/sweeps", json=payload)
+    assert response.status_code == 422
+    assert "exceeds limit" in response.json()["detail"]
+
+
+def test_launch_rate_limit_blocks_excessive_calls(client, eager_celery, make_payload, monkeypatch):
+    """Token bucket: more than N launches per window for one sweep ⇒ 429 + Retry-After."""
+    from app.config import settings as _settings
+
+    # Tighten the bucket to a deterministic shape for the test.
+    monkeypatch.setattr(_settings, "launch_rate_limit_per_window", 2)
+    monkeypatch.setattr(_settings, "launch_rate_limit_window_seconds", 5.0)
+
+    sweep = client.post(
+        "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1, base_seed=99)
+    ).json()
+
+    assert client.post(f"/sweeps/{sweep['id']}/launch").status_code == 200
+    assert client.post(f"/sweeps/{sweep['id']}/launch").status_code == 200
+    third = client.post(f"/sweeps/{sweep['id']}/launch")
+    assert third.status_code == 429
+    assert "Retry-After" in third.headers
+
+
 def test_failures_endpoint_returns_empty_for_clean_sweep(client, eager_celery, make_payload):
     sweep = client.post(
         "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)

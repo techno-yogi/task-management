@@ -104,6 +104,27 @@ class SweepStatusResponse(BaseModel):
     tasks: StatusCounts
 
 
+class SweepSummary(BaseModel):
+    """Compact sweep header for listing endpoints — no chunk/job/task graph."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    status: str
+    finalized_by: str | None
+    total_chunks: int
+    total_jobs: int
+    total_tasks: int
+
+
+class SweepListResponse(BaseModel):
+    items: list[SweepSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class FailedTaskRead(BaseModel):
     """One row in the DLQ view (GET /sweeps/{id}/failures)."""
 

@@ -242,15 +242,38 @@ def dispatch_next_chunk_task(self, sweep_id: int, chunk_ordinal: int) -> dict[st
     }
 
 
-def launch_sweep_workflow(sweep_id: int, from_ordinal: int = 1):
-    """Kick off chunk-by-chunk execution starting at from_ordinal (1-indexed).
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def prepare_and_dispatch_sweep_task(self, sweep_id: int, from_ordinal: int) -> dict[str, Any]:
+    """Worker-side reset + first dispatch.
 
-    For resume: pass from_ordinal=K to skip earlier completed chunks. Any chunks at or after
-    from_ordinal whose status is not 'done' are reset to pending so they execute cleanly.
+    Moves the (potentially expensive, O(chunks*jobs*tasks)) reset out of the
+    POST /launch request path so that endpoint stays O(1). Eager mode runs
+    this synchronously which preserves the test assertion that a launched
+    sweep is `done` by the time the request returns.
     """
     with SyncSessionLocal() as session:
         reset_sweep_for_relaunch(session, sweep_id, from_ordinal)
-    return dispatch_next_chunk_task.apply_async(
+    result = dispatch_next_chunk_task.apply_async(
+        args=[sweep_id, from_ordinal],
+        queue=settings.celery_queue_sweep_finalize,
+    )
+    return {
+        "sweep_id": sweep_id,
+        "from_ordinal": from_ordinal,
+        "phase": "dispatched",
+        "task_id": result.id,
+    }
+
+
+def launch_sweep_workflow(sweep_id: int, from_ordinal: int = 1):
+    """Kick off chunk-by-chunk execution starting at from_ordinal (1-indexed).
+
+    Returns a Celery AsyncResult immediately — the heavy reset_sweep_for_relaunch
+    work happens on a worker (`prepare_and_dispatch_sweep_task`). This keeps
+    POST /launch O(1) even for very large sweeps. For resume: pass
+    from_ordinal=K to skip earlier completed chunks.
+    """
+    return prepare_and_dispatch_sweep_task.apply_async(
         args=[sweep_id, from_ordinal],
         queue=settings.celery_queue_sweep_finalize,
     )

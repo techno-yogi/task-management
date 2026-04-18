@@ -40,10 +40,10 @@ async def main() -> int:
         # Wait for chunk 1 to be done before restarting API.
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            r = await client.get(f"/sweeps/{sweep_id}")
+            r = await client.get(f"/sweeps/{sweep_id}/status")
             r.raise_for_status()
             data = r.json()
-            if any(c["status"] == "done" for c in data["chunks"]):
+            if data["chunks"]["done"] >= 1:
                 break
             await asyncio.sleep(0.5)
         print(f"[3] chunk 1 done; restarting API container NOW", flush=True)
@@ -60,7 +60,7 @@ async def main() -> int:
         last_status = None
         while time.monotonic() < deadline:
             try:
-                r = await client.get(f"/sweeps/{sweep_id}")
+                r = await client.get(f"/sweeps/{sweep_id}/status")
                 r.raise_for_status()
             except Exception:
                 if not api_came_back:
@@ -72,8 +72,8 @@ async def main() -> int:
                 print(f"[4] API reachable again after {time.perf_counter() - restart_t0:.1f}s", flush=True)
             data = r.json()
             if data["status"] != last_status:
-                done_chunks = sum(1 for c in data["chunks"] if c["status"] == "done")
-                print(f"  status={data['status']}  chunks_done={done_chunks}/{len(data['chunks'])}", flush=True)
+                done_chunks = data["chunks"]["done"]
+                print(f"  status={data['status']}  chunks_done={done_chunks}/{data['total_chunks']}", flush=True)
                 last_status = data["status"]
             if data["status"] == "done":
                 if data["total_tasks"] != expected_total:

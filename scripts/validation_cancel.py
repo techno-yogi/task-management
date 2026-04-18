@@ -43,9 +43,9 @@ async def main() -> int:
 
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            r = await client.get(f"/sweeps/{sweep_id}"); r.raise_for_status()
+            r = await client.get(f"/sweeps/{sweep_id}/status"); r.raise_for_status()
             data = r.json()
-            done = sum(1 for c in data["chunks"] if c["status"] == "done")
+            done = data["chunks"]["done"]
             if done >= 2:
                 print(f"[3] {done}/{chunks} chunks done; CANCELLING NOW", flush=True)
                 break

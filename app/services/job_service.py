@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 
@@ -30,42 +30,98 @@ def _serialize_context(shared_context: dict[str, int | str | float]) -> str:
 
 
 async def create_sweep_async(session: AsyncSession, payload: SweepCreate) -> Sweep:
-    sweep = Sweep(name=payload.name, status="pending")
-    total_jobs = 0
-    total_tasks = 0
+    """Create a sweep graph (chunks → jobs → tasks) in three batched inserts.
 
+    Compared to the previous per-row ORM-add approach, this issues ONE
+    bulk insert per level (chunks, then jobs, then task_variants) using
+    `insert().returning(id)` to capture the auto-generated PKs in order.
+    For a 50k-task sweep this drops creation time from ~57k INSERTs in
+    one transaction down to 3 round-trips.
+
+    Insertion order assumptions: Postgres / sqlite both honor the order of
+    `VALUES (...)` rows when emitting `RETURNING id` — i.e. the i-th
+    returned id corresponds to the i-th input row.
+    """
+    chunk_total_jobs: list[int] = []
+    chunk_total_tasks: list[int] = []
+    grand_total_jobs = 0
+    grand_total_tasks = 0
     for chunk_payload in payload.chunks:
-        chunk = Chunk(ordinal=chunk_payload.ordinal, status="pending")
-        chunk_task_count = 0
-        for job_payload in chunk_payload.jobs:
-            job = Job(
-                name=job_payload.name,
-                status="pending",
-                attempts=0,
-                shared_context_json=_serialize_context(job_payload.shared_context),
-            )
-            for task_payload in job_payload.tasks:
-                job.tasks.append(
-                    TaskVariant(
-                        point_idx=task_payload.point_idx,
-                        name=task_payload.name,
-                        expected_value=task_payload.expected_value,
-                        status="pending",
-                    )
-                )
-            chunk_task_count += len(job.tasks)
-            total_jobs += 1
-            chunk.jobs.append(job)
-        chunk.total_jobs = len(chunk.jobs)
-        chunk.total_tasks = chunk_task_count
-        total_tasks += chunk_task_count
-        sweep.chunks.append(chunk)
+        n_jobs = len(chunk_payload.jobs)
+        n_tasks = sum(len(j.tasks) for j in chunk_payload.jobs)
+        chunk_total_jobs.append(n_jobs)
+        chunk_total_tasks.append(n_tasks)
+        grand_total_jobs += n_jobs
+        grand_total_tasks += n_tasks
 
-    sweep.total_chunks = len(sweep.chunks)
-    sweep.total_jobs = total_jobs
-    sweep.total_tasks = total_tasks
-
+    sweep = Sweep(
+        name=payload.name,
+        status="pending",
+        total_chunks=len(payload.chunks),
+        total_jobs=grand_total_jobs,
+        total_tasks=grand_total_tasks,
+    )
     session.add(sweep)
+    await session.flush()  # populate sweep.id without committing
+
+    if not payload.chunks:
+        await session.commit()
+        return await get_sweep_async(session, sweep.id)
+
+    chunk_rows = [
+        {
+            "sweep_id": sweep.id,
+            "ordinal": chunk.ordinal,
+            "status": "pending",
+            "total_jobs": chunk_total_jobs[i],
+            "total_tasks": chunk_total_tasks[i],
+        }
+        for i, chunk in enumerate(payload.chunks)
+    ]
+    chunk_id_result = await session.execute(insert(Chunk).returning(Chunk.id), chunk_rows)
+    chunk_ids = [row[0] for row in chunk_id_result.all()]
+
+    job_rows: list[dict[str, Any]] = []
+    job_chunk_index: list[int] = []  # which chunk each job belongs to (for FK)
+    for ci, chunk_payload in enumerate(payload.chunks):
+        for job_payload in chunk_payload.jobs:
+            job_rows.append(
+                {
+                    "chunk_id": chunk_ids[ci],
+                    "name": job_payload.name,
+                    "status": "pending",
+                    "attempts": 0,
+                    "shared_context_json": _serialize_context(job_payload.shared_context),
+                }
+            )
+            job_chunk_index.append(ci)
+
+    if not job_rows:
+        await session.commit()
+        return await get_sweep_async(session, sweep.id)
+
+    job_id_result = await session.execute(insert(Job).returning(Job.id), job_rows)
+    job_ids = [row[0] for row in job_id_result.all()]
+
+    task_rows: list[dict[str, Any]] = []
+    job_idx = 0
+    for chunk_payload in payload.chunks:
+        for job_payload in chunk_payload.jobs:
+            for task_payload in job_payload.tasks:
+                task_rows.append(
+                    {
+                        "job_id": job_ids[job_idx],
+                        "point_idx": task_payload.point_idx,
+                        "name": task_payload.name,
+                        "expected_value": task_payload.expected_value,
+                        "status": "pending",
+                    }
+                )
+            job_idx += 1
+
+    if task_rows:
+        await session.execute(insert(TaskVariant), task_rows)
+
     await session.commit()
     return await get_sweep_async(session, sweep.id)
 
@@ -78,6 +134,29 @@ async def get_sweep_async(session: AsyncSession, sweep_id: int) -> Sweep | None:
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def list_sweeps_async(
+    session: AsyncSession,
+    *,
+    status_filter: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[Sweep], int]:
+    """Paginated sweep listing for dashboards / operators.
+
+    Returns (items, total_count). Sorted by id DESC so the most-recent sweep
+    is first. `status_filter` matches `Sweep.status` exactly when provided.
+    """
+    base = select(Sweep)
+    if status_filter is not None:
+        base = base.where(Sweep.status == status_filter)
+
+    total = (await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    rows = (
+        await session.execute(base.order_by(Sweep.id.desc()).limit(limit).offset(offset))
+    ).scalars().all()
+    return list(rows), int(total)
 
 
 async def get_sweep_status_async(session: AsyncSession, sweep_id: int) -> dict[str, Any] | None:
