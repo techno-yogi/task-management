@@ -1,0 +1,82 @@
+---
+- name: Ensure app group exists
+  ansible.builtin.group:
+    name: deploy
+    state: present
+
+- name: Ensure app user exists
+  ansible.builtin.user:
+    name: deploy
+    group: deploy
+    shell: /bin/bash
+    create_home: true
+    state: present
+
+- name: Ensure application directory exists
+  ansible.builtin.file:
+    path: /opt/sweep-app
+    state: directory
+    owner: deploy
+    group: deploy
+    mode: "0750"
+
+- name: Ensure compose state directories exist
+  ansible.builtin.file:
+    path: "/opt/sweep-app/{{ item }}"
+    state: directory
+    owner: deploy
+    group: deploy
+    mode: "0750"
+  loop:
+    - postgres
+    - redis
+
+- name: Log in to GHCR on target host
+  community.docker.docker_login:
+    registry_url: ghcr.io
+    username: "{{ ghcr_username }}"
+    password: "{{ ghcr_token }}"
+  no_log: true
+
+- name: Render application env file
+  ansible.builtin.template:
+    src: app.env.j2
+    dest: /opt/sweep-app/.env
+    owner: deploy
+    group: deploy
+    mode: "0600"
+  no_log: true
+
+- name: Render docker compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: /opt/sweep-app/docker-compose.yml
+    owner: deploy
+    group: deploy
+    mode: "0640"
+
+- name: Pull latest images
+  ansible.builtin.command:
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml pull
+    chdir: /opt/sweep-app
+
+- name: Apply database migrations with API image
+  ansible.builtin.command:
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml run --rm api alembic upgrade head
+    chdir: /opt/sweep-app
+
+- name: Restart stack
+  ansible.builtin.command:
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml up -d --remove-orphans
+    chdir: /opt/sweep-app
+
+- name: Show running services
+  ansible.builtin.command:
+    cmd: docker compose --env-file /opt/sweep-app/.env -f /opt/sweep-app/docker-compose.yml ps
+    chdir: /opt/sweep-app
+  register: compose_ps
+  changed_when: false
+
+- name: Print service status
+  ansible.builtin.debug:
+    var: compose_ps.stdout_lines

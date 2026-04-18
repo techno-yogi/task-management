@@ -1,0 +1,6 @@
+---
+- name: Deploy FastAPI + Celery sweep app
+  hosts: app
+  become: true
+  roles:
+    - app

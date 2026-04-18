@@ -1,0 +1,129 @@
+name: Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: Optional image tag override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "image_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.image_tag }}
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add target host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible>=9,<11"
+          ansible-galaxy collection install -r deploy/requirements.yml
+
+      - name: Write vault password file
+        run: |
+          umask 177
+          printf '%s' "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass.txt
+
+      - name: Deploy with Ansible
+        env:
+          APP_IMAGE: ghcr.io/${{ github.repository }}
+          APP_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          APP_ENV: ${{ secrets.APP_ENV }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DATABASE_URL_ASYNC: ${{ secrets.DATABASE_URL_ASYNC }}
+          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
+          APP_CELERY_BROKER_URL: ${{ secrets.APP_CELERY_BROKER_URL }}
+          APP_CELERY_RESULT_BACKEND: ${{ secrets.APP_CELERY_RESULT_BACKEND }}
+          WEB_CONCURRENCY: ${{ secrets.WEB_CONCURRENCY }}
+          CELERY_WORKER_COUNT: ${{ secrets.CELERY_WORKER_COUNT }}
+          CELERY_WORKER_CONCURRENCY: ${{ secrets.CELERY_WORKER_CONCURRENCY }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ansible-playbook \
+            -i deploy/inventory/${{ inputs.environment }}.ini \
+            deploy/playbooks/deploy.yml \
+            --vault-password-file .vault_pass.txt \
+            -e target_env=${{ inputs.environment }} \
+            -e app_image="$APP_IMAGE" \
+            -e app_image_tag="$APP_IMAGE_TAG" \
+            -e app_env="$APP_ENV" \
+            -e app_port="$APP_PORT" \
+            -e postgres_user="$POSTGRES_USER" \
+            -e postgres_password="$POSTGRES_PASSWORD" \
+            -e postgres_db="$POSTGRES_DB" \
+            -e secret_key="$SECRET_KEY" \
+            -e redis_url="$REDIS_URL" \
+            -e database_url_async="$DATABASE_URL_ASYNC" \
+            -e database_url_sync="$DATABASE_URL_SYNC" \
+            -e app_celery_broker_url="$APP_CELERY_BROKER_URL" \
+            -e app_celery_result_backend="$APP_CELERY_RESULT_BACKEND" \
+            -e web_concurrency="$WEB_CONCURRENCY" \
+            -e celery_worker_count="$CELERY_WORKER_COUNT" \
+            -e celery_worker_concurrency="$CELERY_WORKER_CONCURRENCY" \
+            -e ghcr_username="$GHCR_USERNAME" \
+            -e ghcr_token="$GHCR_TOKEN"

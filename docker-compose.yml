@@ -1,0 +1,137 @@
+volumes:
+  pgdata:
+  pgssl:
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    command:
+      - "postgres"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_cert_file=/var/lib/postgresql/ssl/server.crt"
+      - "-c"
+      - "ssl_key_file=/var/lib/postgresql/ssl/server.key"
+      - "-c"
+      - "max_connections=600"
+      - "-c"
+      - "shared_buffers=256MB"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgssl:/var/lib/postgresql/ssl
+    # Map to host port 55432 (not 5432) because a native Windows Postgres install
+    # commonly binds 5432 first, which causes docker's port forward to silently
+    # route to the wrong server and break SSL handshakes from Windows workers.
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    # Same reason as postgres: avoid colliding with any local Redis service.
+    ports:
+      - "56379:6379"
+
+  api:
+    build: .
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - pgssl:/etc/ssl/postgres:ro
+    environment:
+      APP_ASYNC_DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/appdb
+      APP_ASYNC_PG_SSL_CA_FILE: /etc/ssl/postgres/server.crt
+      APP_SYNC_DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/appdb?sslmode=verify-full&sslrootcert=/etc/ssl/postgres/server.crt
+      APP_ASYNC_DB_POOL_SIZE: "55"
+      APP_ASYNC_DB_MAX_OVERFLOW: "50"
+      APP_SYNC_DB_POOL_SIZE: "40"
+      APP_SYNC_DB_MAX_OVERFLOW: "60"
+      APP_CELERY_BROKER_URL: redis://redis:6379/0
+      APP_CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8000:8000"
+
+  # Each container forks --concurrency child procs (prefork). Each child has its own
+  # SQLAlchemy engine so total max DB conns = scale * concurrency * (pool+overflow).
+  # Recommended scaling: `--scale worker_exec=12` with concurrency=8 => 96 child procs
+  # on sweep.execution, ~96 * 3 = 288 max conns from this tier.
+  worker_exec:
+    build: .
+    # --prefetch-multiplier=1 + --disable-prefetch (Celery 5.5+, Redis only):
+    # the container does NOT buffer N=concurrency messages; it pulls one ONLY when
+    # a child slot is actually free. This stops fast Docker workers from hoarding
+    # the queue and lets idle workers (incl. Windows solo workers) participate.
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=exec@%h --concurrency=8 --prefetch-multiplier=1 --disable-prefetch --queues=sweep.execution
+    volumes: &worker_volumes
+      - pgssl:/etc/ssl/postgres:ro
+    environment: &worker_env
+      APP_ASYNC_DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/appdb
+      APP_ASYNC_PG_SSL_CA_FILE: /etc/ssl/postgres/server.crt
+      APP_SYNC_DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/appdb?sslmode=verify-full&sslrootcert=/etc/ssl/postgres/server.crt
+      # Each forked child only runs 1 task at a time. Keep the pool minimal to avoid
+      # blowing past pg max_connections under high scale.
+      APP_SYNC_DB_POOL_SIZE: "1"
+      APP_SYNC_DB_MAX_OVERFLOW: "2"
+      APP_CELERY_BROKER_URL: redis://redis:6379/0
+      APP_CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Aggregate workers handle finalize_job + finalize_chunk (1 task per job/chunk, fast).
+  # Recommended: `--scale worker_aggregate=2` => 2 * 8 = 16 child procs.
+  worker_aggregate:
+    build: .
+    # Aggregate/finalize tasks are short (~50ms) and form a cascade: chunk-done -> finalize_chunk
+    # -> dispatch_next_chunk -> chord -> finalize_job -> finalize_chunk -> ...
+    # Keep --prefetch-multiplier=1 (1 reserved per child) but DO NOT --disable-prefetch:
+    # disable-prefetch adds BRPOP wake-up latency that empirically stalled the cascade ~60s
+    # at the tail of a sweep.
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=aggregate@%h --concurrency=8 --prefetch-multiplier=1 --queues=sweep.job.finalize,sweep.chunk.finalize
+    volumes: *worker_volumes
+    environment:
+      <<: *worker_env
+      APP_SYNC_DB_POOL_SIZE: "1"
+      APP_SYNC_DB_MAX_OVERFLOW: "3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Sweep-finalize workers run BOTH finalize_sweep_task AND dispatch_next_chunk_task
+  # (one dispatcher invocation PER chunk PER sweep, so this queue can spike).
+  # Recommended: `--scale worker_sweep_finalize=2` => 2 * 8 = 16 child procs.
+  worker_sweep_finalize:
+    build: .
+    # Same rationale as worker_aggregate: dispatch_next_chunk_task is on the critical path
+    # of the sequential-chunk dispatcher. Wake-up latency from --disable-prefetch directly
+    # extends the wall time of every multi-chunk sweep.
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO --hostname=sweepfinal@%h --concurrency=8 --prefetch-multiplier=1 --queues=sweep.sweep.finalize
+    volumes: *worker_volumes
+    environment:
+      <<: *worker_env
+      APP_SYNC_DB_POOL_SIZE: "1"
+      APP_SYNC_DB_MAX_OVERFLOW: "3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
