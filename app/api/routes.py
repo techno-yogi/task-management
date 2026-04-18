@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
-from app.db.async_db import get_async_session
+from app.db.async_db import async_engine, get_async_session
 from app.db.sync_db import SyncSessionLocal, get_pg_stat_activity_snapshot, get_pool_snapshot
 from app.metrics import CONTENT_TYPE_LATEST, metrics_payload
 from app.config import settings
@@ -14,23 +17,134 @@ from app.schemas.job import (
     SweepFailuresResponse,
     SweepLaunchResponse,
     SweepLaunchStatusResponse,
+    SweepListResponse,
     SweepRead,
     SweepStatusResponse,
+    SweepSummary,
 )
 from app.services.job_service import (
     create_sweep_async,
     get_sweep_async,
     get_sweep_status_async,
     list_sweep_failures,
+    list_sweeps_async,
 )
 from app.tasks import launch_sweep_workflow
 
 router = APIRouter(tags=["sweeps"])
+log = logging.getLogger("app.api.routes")
 
 
 @router.get("/health")
 def health() -> dict[str, str]:
+    """Liveness probe — is the API process up? Always returns 200.
+
+    Use `/health/ready` for orchestrator readiness checks (DB + broker + migrations).
+    """
     return {"status": "ok"}
+
+
+@router.get("/health/ready")
+async def health_ready(response: Response) -> dict[str, object]:
+    """Readiness probe — verifies the API can actually serve traffic.
+
+    Checks (in order, all must pass):
+    * Postgres reachable: `SELECT 1` against the async pool.
+    * Redis broker reachable: ping the broker connection.
+    * Alembic schema at head: `alembic_version.version_num` matches the latest
+      revision script (Postgres only; sqlite/in-memory test setups skip this
+      since they bypass Alembic via Base.metadata.create_all).
+
+    Returns 200 with per-check details on success, 503 with the failing check
+    on failure. Designed for k8s/Docker `livenessProbe`/`readinessProbe`.
+    """
+    checks: dict[str, object] = {}
+    overall_ok = True
+
+    try:
+        async with async_engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["db"] = {"ok": True}
+    except Exception as exc:
+        checks["db"] = {"ok": False, "error": str(exc)[:200]}
+        overall_ok = False
+
+    try:
+        with celery_app.connection_for_read() as conn:
+            conn.ensure_connection(max_retries=1, timeout=2)
+        checks["broker"] = {"ok": True}
+    except Exception as exc:
+        checks["broker"] = {"ok": False, "error": str(exc)[:200]}
+        overall_ok = False
+
+    try:
+        head = _alembic_head_revision()
+        if head is None:
+            checks["alembic"] = {"ok": True, "skipped": "non-postgres backend"}
+        else:
+            async with async_engine.connect() as conn:
+                row = (
+                    await conn.execute(text("SELECT version_num FROM alembic_version"))
+                ).first()
+            current = row[0] if row else None
+            ok = current == head
+            checks["alembic"] = {"ok": ok, "current": current, "head": head}
+            if not ok:
+                overall_ok = False
+    except Exception as exc:
+        # No alembic_version table = pre-migration or non-managed DB.
+        # We don't fail readiness on that — the DB ping above already covered
+        # "is the DB usable". Surface the detail for diagnostics.
+        checks["alembic"] = {"ok": True, "skipped": f"check failed: {str(exc)[:120]}"}
+
+    if not overall_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "ready" if overall_ok else "not_ready", "checks": checks}
+
+
+def _alembic_head_revision() -> str | None:
+    """Return the latest Alembic revision id, or None if not applicable.
+
+    For postgres backends we expect a managed schema. For sqlite (tests) we
+    return None so the readiness check skips it.
+    """
+    from app.config import settings as _settings
+
+    if "sqlite" in _settings.sync_database_url:
+        return None
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        cfg = Config("alembic.ini")
+        script = ScriptDirectory.from_config(cfg)
+        return script.get_current_head()
+    except Exception:
+        return None
+
+
+@router.get("/sweeps", response_model=SweepListResponse)
+async def list_sweeps(
+    status_filter: str | None = Query(None, alias="status", description="Exact match on sweep.status (pending|running|done|failed)"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_async_session),
+) -> SweepListResponse:
+    """Paginated sweep listing — header rows only (no chunks/jobs/tasks).
+
+    Use `?status=running` to power dashboards. Sort order is id DESC so the
+    most-recent sweep is first. `total` reflects the filtered count, not the
+    table cardinality.
+    """
+    items, total = await list_sweeps_async(
+        session, status_filter=status_filter, limit=limit, offset=offset
+    )
+    return SweepListResponse(
+        items=[SweepSummary.model_validate(s) for s in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/sweeps", response_model=SweepRead, status_code=status.HTTP_201_CREATED)

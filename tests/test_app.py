@@ -200,6 +200,48 @@ def test_complete_task_double_call_only_one_winner(client, sync_session_factory,
         assert row.status == "done"
 
 
+def test_health_ready_returns_200_when_db_is_up(client):
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["checks"]["db"]["ok"] is True
+    assert body["checks"]["broker"]["ok"] is True
+    # Sqlite test setup skips alembic check.
+    assert "skipped" in body["checks"]["alembic"]
+
+
+def test_list_sweeps_paginates_and_filters_by_status(client, eager_celery, make_payload):
+    """`GET /sweeps?status=done&limit=&offset=` returns header-only sweep summaries."""
+    pending_ids: list[int] = []
+    done_ids: list[int] = []
+    for i in range(5):
+        sweep = client.post(
+            "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=1, base_seed=10_000 + i)
+        ).json()
+        if i % 2 == 0:
+            done = client.post(f"/sweeps/{sweep['id']}/launch")
+            assert done.status_code == 200
+            done_ids.append(sweep["id"])
+        else:
+            pending_ids.append(sweep["id"])
+
+    resp_all = client.get("/sweeps").json()
+    assert resp_all["total"] >= 5
+    # Header-only summaries — no chunks/jobs in response shape.
+    assert all("chunks" not in item for item in resp_all["items"])
+
+    resp_done = client.get("/sweeps?status=done").json()
+    returned_done = {item["id"] for item in resp_done["items"]}
+    assert set(done_ids).issubset(returned_done)
+    assert all(item["status"] == "done" for item in resp_done["items"])
+
+    page1 = client.get("/sweeps?limit=2&offset=0").json()
+    page2 = client.get("/sweeps?limit=2&offset=2").json()
+    assert len(page1["items"]) == 2 and len(page2["items"]) == 2
+    assert {p["id"] for p in page1["items"]}.isdisjoint({p["id"] for p in page2["items"]})
+
+
 def test_failures_endpoint_returns_empty_for_clean_sweep(client, eager_celery, make_payload):
     sweep = client.post(
         "/sweeps", json=make_payload(chunks=1, jobs_per_chunk=1, tasks_per_job=2)
