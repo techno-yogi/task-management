@@ -114,15 +114,16 @@ async def main() -> int:
         r.raise_for_status()
         print(f"[7] relaunch: {r.json()}", flush=True)
 
-        # Wait for completion.
+        # Wait for completion. Use the lightweight /status endpoint so polling
+        # doesn't dominate DB load even at sub-second cadence (P0-3 + P2-5).
         deadline = time.monotonic() + 240
         last_status = None
         while time.monotonic() < deadline:
-            r = await client.get(f"/sweeps/{sweep_id}")
+            r = await client.get(f"/sweeps/{sweep_id}/status")
             r.raise_for_status()
             data = r.json()
             if data["status"] != last_status:
-                print(f"  status={data['status']}  chunks_done={sum(1 for c in data['chunks'] if c['status']=='done')}/{len(data['chunks'])}", flush=True)
+                print(f"  status={data['status']}  chunks_done={data['chunks']['done']}/{data['total_chunks']}", flush=True)
                 last_status = data["status"]
             if data["status"] == "done":
                 break

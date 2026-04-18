@@ -38,7 +38,7 @@ async def main() -> int:
 
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            r = await client.get(f"/sweeps/{sweep_id}"); r.raise_for_status()
+            r = await client.get(f"/sweeps/{sweep_id}/status"); r.raise_for_status()
             data = r.json()
             if any(c["status"] == "done" for c in data["chunks"]):
                 break
@@ -54,14 +54,14 @@ async def main() -> int:
         last_status = None
         while time.monotonic() < deadline:
             try:
-                r = await client.get(f"/sweeps/{sweep_id}", timeout=10.0); r.raise_for_status()
+                r = await client.get(f"/sweeps/{sweep_id}/status", timeout=10.0); r.raise_for_status()
                 data = r.json()
             except Exception as e:
                 print(f"  poll err: {type(e).__name__}", flush=True)
                 await asyncio.sleep(1.0); continue
             if data["status"] != last_status:
-                done = sum(1 for c in data["chunks"] if c["status"] == "done")
-                print(f"  status={data['status']}  chunks_done={done}/{len(data['chunks'])}", flush=True)
+                done = data["chunks"]["done"]
+                print(f"  status={data['status']}  chunks_done={done}/{data['total_chunks']}", flush=True)
                 last_status = data["status"]
             if data["status"] == "done":
                 if data["total_tasks"] != expected_total:

@@ -96,15 +96,17 @@ powershell -ExecutionPolicy Bypass -File scripts/start_local_workers.ps1 -Stop
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/sweeps` | Create a sweep graph (chunks → jobs → tasks). Async handler. |
+| `POST` | `/sweeps` | Create a sweep graph (chunks → jobs → tasks). Bulk-insert (3 round-trips). 422 if size exceeds quota. |
+| `GET`  | `/sweeps` | Paginated header-only listing. Query params: `status=`, `limit=` (≤500), `offset=`. |
 | `GET`  | `/sweeps/{id}` | Read full sweep graph (eager-loads chunks/jobs/tasks). Async handler. |
 | `GET`  | `/sweeps/{id}/status` | **Lightweight** sweep header + per-status counts at every level (3 GROUP BYs). Use this for high-frequency polling instead of `GET /sweeps/{id}`. |
 | `GET`  | `/sweeps/{id}/failures` | DLQ view — failed `task_variants` for the sweep (retries-exhausted + validation mismatches). |
-| `POST` | `/sweeps/{id}/launch?from_chunk=K` | Reset chunks ≥ K to pending and queue the dispatcher. Returns `{status: "queued", root_task_id}`. Sync handler (uses Celery `apply_async`). |
+| `POST` | `/sweeps/{id}/launch?from_chunk=K` | Enqueue `prepare_and_dispatch_sweep_task` (O(1) — reset runs on a worker). Rate-limited per sweep (default 4 / 5s ⇒ 429). |
 | `GET`  | `/sweeps/{id}/launch/{root_task_id}` | Poll the dispatcher’s `AsyncResult` (ready/state/successful). Sync handler. |
 | `GET`  | `/diagnostics/db` | SQLAlchemy pool snapshot + `pg_stat_activity` rollup. |
 | `GET`  | `/metrics` | Prometheus exposition. |
-| `GET`  | `/health` | Liveness probe. |
+| `GET`  | `/health` | Liveness probe (always 200 if process is up). |
+| `GET`  | `/health/ready` | Readiness probe — DB ping + broker ping + alembic head check. 503 on any failure. |
 
 `POST /launch` is **non-blocking** — it returns immediately after enqueueing the
 first dispatcher task. Clients poll `GET /sweeps/{id}` for `status='done'`.
@@ -229,4 +231,5 @@ TEST_POSTGRES_URL='postgresql+psycopg://app:app@localhost:55432/appdb?sslmode=re
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design, data model, why each piece exists
 * [`docs/VALIDATION.md`](docs/VALIDATION.md) — full validation transcripts + ops runbook
-* [`docs/ROADMAP.md`](docs/ROADMAP.md) — prioritized robustness/perf improvements
+* [`docs/SCALING.md`](docs/SCALING.md) — tier-aware sizing formulas + DB / Redis budgets
+* [`docs/ROADMAP.md`](docs/ROADMAP.md) — prioritized robustness/perf improvements (12/18 shipped)

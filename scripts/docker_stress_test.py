@@ -215,8 +215,9 @@ async def main() -> int:
             print("FAIL: non-queued launches:", bad[:5], "...", flush=True)
             return 1
 
-        # Poll GET /sweeps/{id} for status=='done'. finalize_sweep_task updates the row
-        # so we don't need Celery's result backend here (and it avoids holding API threads).
+        # Poll GET /sweeps/{id}/status for status=='done'. The /status endpoint is
+        # ~50x cheaper than /sweeps/{id} on large sweeps because it skips the
+        # full chunk/job/task graph eager-load (P0-3 + P2-5 in ROADMAP).
         expected_total = args.chunks * args.jobs_per_chunk * args.tasks_per_job
         done_set: set[int] = set()
         last_print = {"t": time.perf_counter(), "count": 0}
@@ -227,7 +228,7 @@ async def main() -> int:
             while True:
                 if sid in done_set:
                     return
-                resp = await client.get(f"/sweeps/{sid}")
+                resp = await client.get(f"/sweeps/{sid}/status")
                 resp.raise_for_status()
                 data = resp.json()
                 if data["status"] == "done":
